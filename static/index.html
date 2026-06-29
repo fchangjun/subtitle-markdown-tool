@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>视频字幕转 Markdown</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>视频字幕转 Markdown</h1>
+        <p>URL 批量处理台</p>
+      </div>
+      <div class="server-state" id="serverState">
+        <span class="dot"></span>
+        <span>就绪</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="input-pane" aria-labelledby="inputTitle">
+        <div class="section-head">
+          <div>
+            <h2 id="inputTitle">输入</h2>
+            <p>每行一个视频链接</p>
+          </div>
+          <span class="limit">最多 1000 条</span>
+        </div>
+
+        <label class="field-label" for="urlInput">视频 URL</label>
+        <textarea id="urlInput" spellcheck="false">https://www.youtube.com/watch?v=gv0WHhKelSE
+https://youtu.be/fGKNUvivvnc?list=PLf2m23nhTg1NxGVFS4ktbFfAVy3Dz2kPd
+https://www.youtube.com/watch?v=f6SIJDGGjuY</textarea>
+
+        <div class="actions">
+          <button class="primary" id="runButton" type="button">
+            <span class="button-icon">▶</span>
+            <span>开始处理</span>
+          </button>
+          <button class="secondary" id="clearButton" type="button">
+            <span class="button-icon">×</span>
+            <span>清空</span>
+          </button>
+        </div>
+
+        <div class="progress-block">
+          <div class="progress-copy">
+            <span id="progressLabel">等待任务</span>
+            <span id="progressCount">0 / 0</span>
+          </div>
+          <div class="progress-track" aria-hidden="true">
+            <div id="progressBar"></div>
+          </div>
+          <div class="summary-grid" id="summaryGrid">
+            <span>成功 0</span>
+            <span>失败 0</span>
+            <span>平均耗时 0s</span>
+            <span>平均重试 0</span>
+            <span>并发 0</span>
+          </div>
+        </div>
+
+        <div class="messages" id="messages"></div>
+
+        <div class="history-block">
+          <div class="history-head">
+            <h2>历史任务</h2>
+            <button class="secondary small" id="refreshHistoryButton" type="button">刷新</button>
+          </div>
+          <div class="history-list" id="historyList">
+            <div class="history-empty">暂无历史任务</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="results-pane" aria-labelledby="resultsTitle">
+        <div class="section-head">
+          <div>
+            <h2 id="resultsTitle">结果</h2>
+            <p id="jobLabel">尚未创建任务</p>
+          </div>
+          <a class="download-all disabled" id="downloadAll" href="#" aria-disabled="true">下载 ZIP</a>
+        </div>
+
+        <div class="result-list" id="resultList">
+          <div class="empty-state">处理完成后显示 Markdown 文件</div>
+        </div>
+
+        <div class="preview-head">
+          <h2>预览</h2>
+          <a id="openPreview" class="preview-link disabled" href="#" target="_blank" rel="noreferrer">打开文件</a>
+        </div>
+        <pre class="preview" id="preview">选择一个结果查看 Markdown</pre>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
