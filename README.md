@@ -87,6 +87,38 @@ python web_app.py --host 127.0.0.1 --port 8765
 python youtube_subtitles_to_md.py "https://www.youtube.com/watch?v=VIDEO_ID" -o markdown
 ```
 
+## 降低限流 / 封 IP 风险
+
+工具默认启用慢速模式：Web 任务串行处理，每次外部请求之间会等待一段时间；检测到 403、429、验证码、not a bot、too many requests 等疑似限流信号后，会自动长时间退避。
+
+可以直接粘贴最多 1000 条 URL。后端会自动排队处理，并默认每 30 条非缓存 URL 休息 5 分钟；如果检测到 YouTube 封禁/限流信号，会自动冷却 15 分钟后继续。页面会显示当前冷却原因和剩余时间。
+
+如果已经被封，先停止任务，等待封禁恢复后再重新运行。不要在封禁期间反复重试，否则会拉长恢复时间。
+
+可用环境变量调整速度：
+
+```bash
+# 每次外部请求至少间隔 8 秒，再叠加 0-4 秒随机抖动
+export SUBTITLE_REQUEST_MIN_INTERVAL_SECONDS=8
+export SUBTITLE_REQUEST_JITTER_SECONDS=4
+
+# 检测到限流/封禁信号后，至少退避 180 秒
+export SUBTITLE_LIMIT_BACKOFF_SECONDS=180
+
+# Web 批量任务自动分批：每 30 条休息 300 秒
+export SUBTITLE_AUTO_BATCH_SIZE=30
+export SUBTITLE_AUTO_BATCH_COOLDOWN_SECONDS=300
+
+# 遇到明确 IP block 后，Web 任务冷却 900 秒再继续
+export SUBTITLE_IP_BLOCK_COOLDOWN_SECONDS=900
+
+# 单条任务失败后的任务级重试退避
+export SUBTITLE_TASK_RETRY_BASE_SECONDS=15
+export SUBTITLE_TASK_RETRY_MAX_SECONDS=180
+```
+
+如果仍然频繁触发封禁，可以把 `SUBTITLE_REQUEST_MIN_INTERVAL_SECONDS` 调到 `15` 或 `30`，或者把 `SUBTITLE_AUTO_BATCH_SIZE` 调小、`SUBTITLE_AUTO_BATCH_COOLDOWN_SECONDS` 调大。
+
 ## 输出目录
 
 Web 页面生成的任务结果默认保存在：

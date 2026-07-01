@@ -2,8 +2,11 @@
 import argparse
 import html
 import json
+import os
+import random
 import re
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -27,10 +30,127 @@ PREFERRED_LANGS = [
 PREFERRED_FORMATS = ["json3", "srv3", "srv2", "srv1", "vtt", "srt", "ttml"]
 
 
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+REQUEST_MIN_INTERVAL_SECONDS = max(0.0, env_float("SUBTITLE_REQUEST_MIN_INTERVAL_SECONDS", 8.0))
+REQUEST_JITTER_SECONDS = max(0.0, env_float("SUBTITLE_REQUEST_JITTER_SECONDS", 4.0))
+LIMIT_BACKOFF_SECONDS = max(0.0, env_float("SUBTITLE_LIMIT_BACKOFF_SECONDS", 180.0))
+TRANSCRIPT_MAX_ATTEMPTS = max(1, env_int("SUBTITLE_TRANSCRIPT_MAX_ATTEMPTS", 3))
+TRANSCRIPT_RETRY_BASE_SECONDS = max(0.0, env_float("SUBTITLE_RETRY_BASE_SECONDS", 8.0))
+TRANSCRIPT_RETRY_MAX_SECONDS = max(0.0, env_float("SUBTITLE_RETRY_MAX_SECONDS", 90.0))
+RATE_LIMIT_STATUS_CODES = {403, 429}
+RATE_LIMIT_PATTERNS = [
+    "too many requests",
+    "http error 429",
+    "rate limit",
+    "requestblocked",
+    "ipblocked",
+    "captcha",
+    "not a bot",
+    "unusual traffic",
+    "temporarily blocked",
+    "blocking requests from your ip",
+    "blocked by youtube",
+    "access denied",
+    "forbidden",
+]
+
+
+class RequestPacer:
+    def __init__(self, min_interval_seconds: float, jitter_seconds: float):
+        self.min_interval_seconds = min_interval_seconds
+        self.jitter_seconds = jitter_seconds
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            delay = max(0.0, self._next_at - now)
+            scheduled_at = max(now, self._next_at)
+            self._next_at = scheduled_at + self.min_interval_seconds + random.uniform(0, self.jitter_seconds)
+        if delay:
+            time.sleep(delay)
+
+    def backoff(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        with self._lock:
+            self._next_at = max(self._next_at, time.monotonic() + seconds + random.uniform(0, self.jitter_seconds))
+
+
+request_pacer = RequestPacer(REQUEST_MIN_INTERVAL_SECONDS, REQUEST_JITTER_SECONDS)
+rate_limit_lock = threading.Lock()
+last_rate_limit_at = 0.0
+
+
+def looks_rate_limited_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(pattern in text for pattern in RATE_LIMIT_PATTERNS)
+
+
+def note_rate_limit(reason: str) -> None:
+    global last_rate_limit_at
+    with rate_limit_lock:
+        last_rate_limit_at = time.monotonic()
+    request_pacer.backoff(LIMIT_BACKOFF_SECONDS)
+    if LIMIT_BACKOFF_SECONDS:
+        print(
+            f"Rate-limit/block signal detected ({reason}); backing off for about {LIMIT_BACKOFF_SECONDS:.0f}s.",
+            file=sys.stderr,
+        )
+
+
+def rate_limit_detected_since(started_at: float) -> bool:
+    with rate_limit_lock:
+        return last_rate_limit_at >= started_at
+
+
+def paced_get(url: str, **kwargs) -> requests.Response:
+    request_pacer.wait()
+    try:
+        response = requests.get(url, **kwargs)
+    except Exception as error:
+        if looks_rate_limited_error(error):
+            note_rate_limit(str(error))
+        raise
+    if response.status_code in RATE_LIMIT_STATUS_CODES:
+        note_rate_limit(f"HTTP {response.status_code} {url}")
+    return response
+
+
+def retry_sleep(attempt: int, error: Optional[Exception] = None) -> None:
+    if error and looks_rate_limited_error(error):
+        note_rate_limit(str(error))
+    delay = min(TRANSCRIPT_RETRY_MAX_SECONDS, TRANSCRIPT_RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+    time.sleep(delay + random.uniform(0, REQUEST_JITTER_SECONDS))
+
+
 class TimeoutSession(requests.Session):
     def request(self, method, url, **kwargs):
         kwargs.setdefault("timeout", 45)
-        return super().request(method, url, **kwargs)
+        request_pacer.wait()
+        try:
+            response = super().request(method, url, **kwargs)
+        except Exception as error:
+            if looks_rate_limited_error(error):
+                note_rate_limit(str(error))
+            raise
+        if response.status_code in RATE_LIMIT_STATUS_CODES:
+            note_rate_limit(f"HTTP {response.status_code} {url}")
+        return response
 
 
 def clean_scalar(value: object) -> str:
@@ -80,7 +200,7 @@ def extract_youtube_oembed_info(url: str) -> Dict:
         "upload_date": "",
     }
     try:
-        response = requests.get(
+        response = paced_get(
             "https://www.youtube.com/oembed",
             params={"url": canonical_url, "format": "json"},
             timeout=20,
@@ -110,7 +230,7 @@ def enrich_youtube_oembed(info: Dict, url: str) -> Dict:
         return info
 
     try:
-        response = requests.get(
+        response = paced_get(
             "https://www.youtube.com/oembed",
             params={"url": canonical_youtube_url(info, url), "format": "json"},
             timeout=30,
@@ -219,7 +339,7 @@ def merge_caption_lines(lines: List[str]) -> str:
 
 
 def fetch_subtitle(track: Dict) -> str:
-    response = requests.get(track["url"], timeout=60)
+    response = paced_get(track["url"], timeout=60)
     response.raise_for_status()
     text = response.text
     ext = track.get("ext")
@@ -231,18 +351,18 @@ def fetch_subtitle(track: Dict) -> str:
 def fetch_youtube_transcript(video_id: str, retry_counter: Optional[List[int]] = None) -> Tuple[str, str, str]:
     last_error = None
     transcript_list = []
-    for attempt in range(1, 4):
+    for attempt in range(1, TRANSCRIPT_MAX_ATTEMPTS + 1):
         try:
             api = YouTubeTranscriptApi(http_client=TimeoutSession())
             transcript_list = list(api.list(video_id))
             break
         except Exception as error:
             last_error = error
-            if attempt == 3:
+            if attempt == TRANSCRIPT_MAX_ATTEMPTS:
                 raise
             if retry_counter is not None:
                 retry_counter[0] += 1
-            time.sleep(2 * attempt)
+            retry_sleep(attempt, error)
 
     if not transcript_list:
         if last_error:
@@ -255,17 +375,17 @@ def fetch_youtube_transcript(video_id: str, retry_counter: Optional[List[int]] =
     transcript_list.sort(key=lambda item: (item.is_generated, lang_rank(item.language_code), item.language_code))
     transcript = transcript_list[0]
     last_error = None
-    for attempt in range(1, 4):
+    for attempt in range(1, TRANSCRIPT_MAX_ATTEMPTS + 1):
         try:
             snippets = transcript.fetch()
             break
         except Exception as error:
             last_error = error
-            if attempt == 3:
+            if attempt == TRANSCRIPT_MAX_ATTEMPTS:
                 raise
             if retry_counter is not None:
                 retry_counter[0] += 1
-            time.sleep(2 * attempt)
+            retry_sleep(attempt, error)
     else:
         raise RuntimeError(f"Could not fetch transcript for YouTube video {video_id}: {last_error}")
     lines = []
@@ -324,9 +444,12 @@ def extract_info(url: str) -> Dict:
         "socket_timeout": 20,
     }
     try:
+        request_pacer.wait()
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
-    except Exception:
+    except Exception as error:
+        if looks_rate_limited_error(error):
+            note_rate_limit(str(error))
         if fallback_info:
             return fallback_info
         raise

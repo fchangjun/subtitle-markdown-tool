@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import json
 import mimetypes
+import os
+import random
 import re
 import threading
 import time
@@ -10,7 +12,6 @@ import zipfile
 import argparse
 import csv
 import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,7 +25,9 @@ from youtube_subtitles_to_md import (
     extract_info,
     fetch_transcript,
     format_date,
+    looks_rate_limited_error,
     markdown_for_video,
+    rate_limit_detected_since,
     youtube_id_from_url,
 )
 
@@ -32,10 +35,31 @@ from youtube_subtitles_to_md import (
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 OUTPUT_DIR = ROOT / "web_outputs"
-MAX_URLS_PER_JOB = 1000
 MAX_BODY_BYTES = 128 * 1024
-TASK_MAX_ATTEMPTS = 3
-JOB_WORKERS = 4
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_URLS_PER_JOB = max(1, env_int("SUBTITLE_MAX_URLS_PER_JOB", 1000))
+TASK_MAX_ATTEMPTS = max(1, env_int("SUBTITLE_TASK_MAX_ATTEMPTS", 3))
+TASK_RETRY_BASE_SECONDS = max(0.0, env_float("SUBTITLE_TASK_RETRY_BASE_SECONDS", 15.0))
+TASK_RETRY_MAX_SECONDS = max(0.0, env_float("SUBTITLE_TASK_RETRY_MAX_SECONDS", 180.0))
+TASK_RETRY_JITTER_SECONDS = max(0.0, env_float("SUBTITLE_TASK_RETRY_JITTER_SECONDS", 10.0))
+AUTO_BATCH_SIZE = max(0, env_int("SUBTITLE_AUTO_BATCH_SIZE", 30))
+AUTO_BATCH_COOLDOWN_SECONDS = max(0.0, env_float("SUBTITLE_AUTO_BATCH_COOLDOWN_SECONDS", 300.0))
+IP_BLOCK_COOLDOWN_SECONDS = max(0.0, env_float("SUBTITLE_IP_BLOCK_COOLDOWN_SECONDS", 900.0))
 
 
 @dataclass
@@ -65,6 +89,8 @@ class Job:
     updated_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
+    message: str = ""
+    cooldown_until: Optional[float] = None
     files: List[JobFile] = field(default_factory=list)
     errors: List[Dict[str, object]] = field(default_factory=list)
 
@@ -137,6 +163,8 @@ def job_to_dict(job: Job) -> Dict:
         "updated_at": job.updated_at,
         "started_at": job.started_at,
         "completed_at": job.completed_at,
+        "message": job.message,
+        "cooldown_until": job.cooldown_until,
         "urls": job.urls,
         "files": [file.__dict__ for file in files],
         "errors": job.errors,
@@ -148,8 +176,11 @@ def job_to_dict(job: Job) -> Dict:
             "average_retry_count": round(sum(retry_values) / completed_count, 3) if completed_count else 0,
             "total_item_elapsed_seconds": round(sum(elapsed_values), 3),
             "wall_elapsed_seconds": wall_time,
-            "worker_count": min(JOB_WORKERS, job.total) if job.total else 0,
+            "worker_count": 1 if job.total else 0,
             "cache_hit_count": cache_hit_count,
+            "auto_batch_size": AUTO_BATCH_SIZE,
+            "auto_batch_cooldown_seconds": AUTO_BATCH_COOLDOWN_SECONDS,
+            "ip_block_cooldown_seconds": IP_BLOCK_COOLDOWN_SECONDS,
         },
     }
 
@@ -162,6 +193,47 @@ def update_job(job_id: str, **changes) -> None:
             setattr(job, key, value)
         job.updated_at = time.time()
     persist_job_summary(job)
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds} 秒"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    hours = minutes // 60
+    rest_minutes = minutes % 60
+    if rest_minutes:
+        return f"{hours} 小时 {rest_minutes} 分钟"
+    return f"{hours} 小时"
+
+
+def set_job_notice(job_id: str, message: str, cooldown_until: Optional[float] = None) -> None:
+    job = None
+    with jobs_lock:
+        job = jobs[job_id]
+        job.message = message
+        job.cooldown_until = cooldown_until
+        job.updated_at = time.time()
+    persist_job_summary(job)
+
+
+def clear_job_notice(job_id: str) -> None:
+    set_job_notice(job_id, "", None)
+
+
+def pause_job(job_id: str, message: str, seconds: float) -> None:
+    if seconds <= 0:
+        return
+    set_job_notice(job_id, message, time.time() + seconds)
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(5, remaining))
+    clear_job_notice(job_id)
 
 
 def add_file(job_id: str, file: JobFile) -> None:
@@ -329,6 +401,8 @@ def job_from_manifest(path: Path) -> Optional[Job]:
         updated_at=float(data.get("updated_at") or path.stat().st_mtime),
         started_at=data.get("started_at"),
         completed_at=data.get("completed_at"),
+        message=clean_scalar(data.get("message") or ""),
+        cooldown_until=data.get("cooldown_until"),
         files=files,
         errors=errors,
     )
@@ -373,6 +447,11 @@ def process_url(url: str, index: int, output_dir: Path, retry_counter: List[int]
         elapsed_seconds=0,
         retry_count=retry_counter[0],
     )
+
+
+def task_retry_sleep(attempt: int) -> None:
+    delay = min(TASK_RETRY_MAX_SECONDS, TASK_RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+    time.sleep(delay + random.uniform(0, TASK_RETRY_JITTER_SECONDS))
 
 
 def rewrite_article_id(markdown: str, index: int) -> str:
@@ -422,30 +501,39 @@ def process_cached_url(url: str, index: int, output_dir: Path) -> Optional[JobFi
     )
 
 
-def process_url_with_retry(url: str, index: int, output_dir: Path):
+def process_url_with_retry(job_id: str, url: str, index: int, output_dir: Path):
     item_start = time.monotonic()
     cached_file = process_cached_url(url, index, output_dir)
     if cached_file:
         cached_file.elapsed_seconds = round(time.monotonic() - item_start, 3)
-        return cached_file, None
+        return cached_file, None, False
 
     retry_counter = [0]
     for attempt in range(1, TASK_MAX_ATTEMPTS + 1):
+        attempt_start = time.monotonic()
         try:
             file = process_url(url, index, output_dir, retry_counter)
             file.elapsed_seconds = round(time.monotonic() - item_start, 3)
             file.retry_count = retry_counter[0]
-            return file, None
+            return file, None, rate_limit_detected_since(attempt_start)
         except Exception as error:
+            was_rate_limited = looks_rate_limited_error(error) or rate_limit_detected_since(attempt_start)
             if attempt >= TASK_MAX_ATTEMPTS:
                 return None, {
                     "url": url,
                     "message": str(error),
                     "elapsed_seconds": round(time.monotonic() - item_start, 3),
                     "retry_count": retry_counter[0],
-                }
+                }, was_rate_limited
             retry_counter[0] += 1
-            time.sleep(min(10, 2 * attempt))
+            if was_rate_limited:
+                pause_job(
+                    job_id,
+                    f"检测到 YouTube 限流，自动冷却 {format_duration(IP_BLOCK_COOLDOWN_SECONDS)} 后重试。",
+                    IP_BLOCK_COOLDOWN_SECONDS,
+                )
+            else:
+                task_retry_sleep(attempt)
 
 
 def process_job(job_id: str) -> None:
@@ -462,40 +550,66 @@ def process_job(job_id: str) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    max_workers = min(JOB_WORKERS, len(urls))
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [
-            pool.submit(process_url_with_retry, url, index, output_dir)
-            for index, url in enumerate(urls, start=1)
-        ]
-        for future in as_completed(futures):
-            try:
-                file, error = future.result()
-                if file:
-                    add_file(job_id, file)
-                elif error:
-                    add_error_record(job_id, error)
-            except Exception as error:
-                add_error_record(
-                    job_id,
-                    {
-                        "url": "unknown",
-                        "message": str(error),
-                        "elapsed_seconds": 0,
-                        "retry_count": 0,
-                    },
-                )
-                traceback.print_exc()
-            with jobs_lock:
-                job = jobs[job_id]
-                job.current += 1
-                job.updated_at = time.time()
+    processed_since_pause = 0
+    for index, url in enumerate(urls, start=1):
+        file = None
+        error_record = None
+        was_rate_limited = False
+        try:
+            file, error_record, was_rate_limited = process_url_with_retry(job_id, url, index, output_dir)
+            if file:
+                add_file(job_id, file)
+            elif error_record:
+                add_error_record(job_id, error_record)
+        except Exception as error:
+            error_record = {
+                "url": url,
+                "message": str(error),
+                "elapsed_seconds": 0,
+                "retry_count": 0,
+            }
+            was_rate_limited = looks_rate_limited_error(error)
+            add_error_record(job_id, error_record)
+            traceback.print_exc()
+
+        with jobs_lock:
+            job = jobs[job_id]
+            job.current += 1
+            job.updated_at = time.time()
+            progress_job = job
+        persist_job_summary(progress_job)
+
+        if index >= len(urls):
+            continue
+
+        if was_rate_limited:
+            processed_since_pause = 0
+            pause_job(
+                job_id,
+                f"检测到 YouTube 限流，自动冷却 {format_duration(IP_BLOCK_COOLDOWN_SECONDS)} 后继续。",
+                IP_BLOCK_COOLDOWN_SECONDS,
+            )
+            continue
+
+        used_network = not (file and file.from_cache)
+        if used_network:
+            processed_since_pause += 1
+
+        if AUTO_BATCH_SIZE and processed_since_pause >= AUTO_BATCH_SIZE:
+            processed_since_pause = 0
+            pause_job(
+                job_id,
+                f"已处理 {AUTO_BATCH_SIZE} 条，自动休息 {format_duration(AUTO_BATCH_COOLDOWN_SECONDS)} 后继续。",
+                AUTO_BATCH_COOLDOWN_SECONDS,
+            )
 
     with jobs_lock:
         job = jobs[job_id]
         job.status = "completed_with_errors" if job.errors else "completed"
         job.current = job.total
         job.completed_at = time.time()
+        job.message = ""
+        job.cooldown_until = None
         job.updated_at = time.time()
         final_job = job
     write_job_artifacts(final_job)

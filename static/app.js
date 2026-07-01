@@ -36,10 +36,7 @@ function setBusy(isBusy) {
 function setMessage(text, type = "info") {
   messages.innerHTML = "";
   if (!text) return;
-  const item = document.createElement("div");
-  item.className = `message ${type}`;
-  item.textContent = text;
-  messages.appendChild(item);
+  appendMessage(text, type);
 }
 
 function recentJobIds() {
@@ -57,18 +54,28 @@ function rememberJob(jobId) {
   localStorage.setItem(RECENT_JOBS_KEY, JSON.stringify(ids));
 }
 
-function appendError(text) {
+function appendMessage(text, type = "info") {
   const item = document.createElement("div");
-  item.className = "message error";
+  item.className = `message ${type}`;
   item.textContent = text;
   messages.appendChild(item);
+}
+
+function appendError(text) {
+  appendMessage(text, "error");
+}
+
+function cooldownRemaining(job) {
+  if (!job.cooldown_until) return 0;
+  return Math.max(0, job.cooldown_until - Date.now() / 1000);
 }
 
 function updateProgress(job) {
   const total = job.total || 0;
   const current = job.current || 0;
   const pct = total > 0 ? Math.round((current / total) * 100) : 0;
-  progressLabel.textContent = statusText[job.status] || "等待任务";
+  const coolingDown = cooldownRemaining(job) > 0;
+  progressLabel.textContent = coolingDown ? "自动冷却" : statusText[job.status] || "等待任务";
   progressCount.textContent = `${current} / ${total}`;
   progressBar.style.width = `${pct}%`;
   const summary = job.summary || {};
@@ -78,6 +85,7 @@ function updateProgress(job) {
     <span>平均耗时 ${formatSeconds(summary.average_elapsed_seconds)}</span>
     <span>平均重试 ${Number(summary.average_retry_count || 0).toFixed(2)}</span>
     <span>并发 ${summary.worker_count || 0}</span>
+    <span>分批 ${summary.auto_batch_size || "关闭"}</span>
   `;
 }
 
@@ -177,6 +185,11 @@ function renderJob(job) {
   renderFiles(job);
 
   messages.innerHTML = "";
+  if (job.message) {
+    const remaining = cooldownRemaining(job);
+    const suffix = remaining > 0 ? `（剩余 ${formatSeconds(remaining)}）` : "";
+    appendMessage(`${job.message}${suffix}`);
+  }
   job.errors.forEach((error) => {
     appendError(
       `${error.url}：${error.message}（耗时 ${formatSeconds(error.elapsed_seconds)}，重试 ${error.retry_count || 0}）`
@@ -192,6 +205,9 @@ function renderJob(job) {
 
   const done = job.status === "completed" || job.status === "completed_with_errors";
   setBusy(!done);
+  if (!done && cooldownRemaining(job) > 0) {
+    serverState.textContent = "自动冷却";
+  }
   if (done && pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
@@ -240,6 +256,7 @@ async function createJob() {
     <span>平均耗时 0s</span>
     <span>平均重试 0</span>
     <span>并发 0</span>
+    <span>分批 -</span>
   `;
 
   try {

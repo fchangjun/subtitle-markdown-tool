@@ -299,6 +299,12 @@ button:disabled {
   background: #fbfcfb;
 }
 
+.message.info {
+  color: var(--accent-strong);
+  border-color: #b9d8cd;
+  background: #f3fbf8;
+}
+
 .message.error {
   color: var(--danger);
   border-color: #e1b6b6;
