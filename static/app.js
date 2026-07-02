@@ -14,12 +14,48 @@ const openPreview = document.querySelector("#openPreview");
 const serverState = document.querySelector("#serverState span:last-child");
 const historyList = document.querySelector("#historyList");
 const refreshHistoryButton = document.querySelector("#refreshHistoryButton");
+const rangeInput = document.querySelector("#rangeInput");
+const maxPerSourceInput = document.querySelector("#maxPerSourceInput");
+const discoverButton = document.querySelector("#discoverButton");
+const refreshDiscovery = document.querySelector("#refreshDiscovery");
+const refreshDiscoveryHistory = document.querySelector("#refreshDiscoveryHistory");
+const discoverySummary = document.querySelector("#discoverySummary");
+const activeDiscoveryLabel = document.querySelector("#activeDiscoveryLabel");
+const discoveryFilterInput = document.querySelector("#discoveryFilterInput");
+const discoveryHistoryList = document.querySelector("#discoveryHistoryList");
+const discoveryList = document.querySelector("#discoveryList");
+const discoveryActions = document.querySelector("#discoveryActions");
+const discoveryStatus = document.querySelector("#discoveryStatus");
+const selectAllDiscovery = document.querySelector("#selectAllDiscovery");
+const clearDiscoverySelection = document.querySelector("#clearDiscoverySelection");
+const importDiscovery = document.querySelector("#importDiscovery");
+const followInput = document.querySelector("#followInput");
+const addChannelsButton = document.querySelector("#addChannelsButton");
+const refreshChannels = document.querySelector("#refreshChannels");
+const refreshChannelButton = document.querySelector("#refreshChannelButton");
+const channelList = document.querySelector("#channelList");
+const channelDetail = document.querySelector("#channelDetail");
+const importQueueSummary = document.querySelector("#importQueueSummary");
+const pageTabs = Array.from(document.querySelectorAll(".tab-button"));
+const pages = {
+  search: document.querySelector("#searchPage"),
+  extract: document.querySelector("#extractPage"),
+};
 
 let activeJobId = null;
 let pollTimer = null;
 let selectedFileUrl = null;
+let activeDiscoveryRecord = null;
+let discoveredVideos = [];
+let selectedDiscoveryUrls = new Set();
+let followedChannels = [];
+let activeChannel = null;
+let selectedChannelIds = new Set();
+let channelSelectionInitialized = false;
 const ACTIVE_JOB_KEY = "subtitleMarkdownTool.activeJobId";
 const RECENT_JOBS_KEY = "subtitleMarkdownTool.recentJobIds";
+const ACTIVE_DISCOVERY_KEY = "subtitleMarkdownTool.activeDiscoveryId";
+const DISCOVERY_SELECTION_PREFIX = "subtitleMarkdownTool.discoverySelection.";
 
 const statusText = {
   queued: "排队中",
@@ -27,6 +63,30 @@ const statusText = {
   completed: "已完成",
   completed_with_errors: "部分完成",
 };
+
+function switchPage(pageName) {
+  Object.entries(pages).forEach(([name, page]) => {
+    page.classList.toggle("active", name === pageName);
+  });
+  pageTabs.forEach((tab) => {
+    tab.classList.toggle("active", tab.dataset.page === pageName);
+  });
+}
+
+function switchContentView(viewName) {
+  const showingResults = viewName === "results";
+  discoveryList.hidden = !showingResults;
+  channelDetail.hidden = showingResults;
+  discoveryActions.hidden = !showingResults;
+  discoveryStatus.hidden = !showingResults;
+  if (!showingResults && !activeChannel) {
+    activeDiscoveryLabel.textContent = "选择一个关注频道查看内容";
+  } else if (showingResults && activeDiscoveryRecord) {
+    activeDiscoveryLabel.textContent = `记录 ${activeDiscoveryRecord.id} · 更新于 ${formatDateTime(activeDiscoveryRecord.updated_at)}`;
+  } else if (showingResults) {
+    activeDiscoveryLabel.textContent = "尚未选择查找记录";
+  }
+}
 
 function setBusy(isBusy) {
   runButton.disabled = isBusy;
@@ -82,9 +142,11 @@ function updateProgress(job) {
   summaryGrid.innerHTML = `
     <span>成功 ${summary.success_count || 0}</span>
     <span>失败 ${summary.error_count || 0}</span>
-    <span>平均耗时 ${formatSeconds(summary.average_elapsed_seconds)}</span>
+    <span>视频总长 ${formatSummaryVideoTotal(summary)}</span>
+    <span>视频均长 ${formatSummaryVideoAverage(summary)}</span>
+    <span>平均提取 ${formatSeconds(summary.average_elapsed_seconds)}</span>
+    <span>提取总耗时 ${formatSeconds(summary.total_item_elapsed_seconds)}</span>
     <span>平均重试 ${Number(summary.average_retry_count || 0).toFixed(2)}</span>
-    <span>并发 ${summary.worker_count || 0}</span>
     <span>分批 ${summary.auto_batch_size || "关闭"}</span>
   `;
 }
@@ -96,8 +158,561 @@ function formatSize(bytes) {
 
 function formatSeconds(value) {
   const number = Number(value || 0);
+  if (number >= 3600) {
+    const hours = Math.floor(number / 3600);
+    const minutes = Math.round((number % 3600) / 60);
+    return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
+  }
   if (number >= 60) return `${Math.floor(number / 60)}m ${Math.round(number % 60)}s`;
   return `${number.toFixed(number >= 10 ? 0 : 1)}s`;
+}
+
+function hasNumber(value) {
+  return value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value));
+}
+
+function formatOptionalSeconds(value) {
+  return hasNumber(value) ? formatSeconds(value) : "未知";
+}
+
+function formatSummaryVideoTotal(summary) {
+  if (summary.video_duration_known_count) return formatSeconds(summary.total_video_duration_seconds);
+  return summary.success_count ? "未知" : "0s";
+}
+
+function formatSummaryVideoAverage(summary) {
+  if (summary.video_duration_known_count) return formatSeconds(summary.average_video_duration_seconds);
+  return summary.success_count ? "未知" : "0s";
+}
+
+function formatViews(value) {
+  if (!hasNumber(value)) return "播放未知";
+  return `${new Intl.NumberFormat("zh-CN").format(Number(value))} 次播放`;
+}
+
+function formatDateTime(seconds) {
+  if (!seconds) return "未知时间";
+  return new Date(Number(seconds) * 1000).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function channelTitle(channel) {
+  const rawTitle = String(channel.title || "");
+  if (rawTitle && !rawTitle.startsWith("http")) {
+    return rawTitle.replace(/\s+-\s+Videos$/i, "");
+  }
+  const value = String(channel.source_url || channel.listing_url || "");
+  const match = value.match(/youtube\.com\/(@[^/?#]+|channel\/[^/?#]+|c\/[^/?#]+|user\/[^/?#]+)/i);
+  if (match) return match[1].replace(/^channel\//, "频道 ").replace(/^c\//, "").replace(/^user\//, "");
+  return value || channel.id;
+}
+
+function channelIntro(channel) {
+  const description = String(channel.description || "").trim();
+  if (description) return description;
+  const handle = channelTitle(channel);
+  if (channel.video_count) return `${handle} 已记录 ${channel.video_count} 个候选视频。`;
+  return "尚未获取频道简介，更新频道后会尝试补全。";
+}
+
+function parseUrlText(text) {
+  return text
+    .split(/[\s,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function updateImportQueueSummary() {
+  const count = parseUrlText(urlInput.value).length;
+  importQueueSummary.textContent = count ? `待提取 ${count} 个视频` : "待提取队列为空";
+}
+
+function renderChannelList(channels) {
+  followedChannels = channels || [];
+  if (!followedChannels.length) {
+    channelList.innerHTML = '<div class="history-empty">暂无关注频道</div>';
+    selectedChannelIds = new Set();
+    channelSelectionInitialized = false;
+    return;
+  }
+
+  if (!channelSelectionInitialized) {
+    selectedChannelIds = new Set(followedChannels.map((channel) => channel.id));
+    channelSelectionInitialized = true;
+  } else {
+    const validIds = new Set(followedChannels.map((channel) => channel.id));
+    selectedChannelIds = new Set(Array.from(selectedChannelIds).filter((id) => validIds.has(id)));
+  }
+
+  channelList.innerHTML = "";
+  followedChannels.forEach((channel) => {
+    const item = document.createElement("article");
+    item.className = "history-item channel-item";
+    if (activeChannel && activeChannel.id === channel.id) item.classList.add("active");
+    const detail = [
+      `${channel.video_count || 0} 个内容`,
+      `${channel.scanned_count || 0} 个已扫`,
+      `${channel.unknown_date_count || 0} 个日期未知`,
+      formatDateTime(channel.last_discovered_at || channel.updated_at),
+    ];
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = selectedChannelIds.has(channel.id);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) selectedChannelIds.add(channel.id);
+      else selectedChannelIds.delete(channel.id);
+      updateChannelSelectionSummary();
+    });
+
+    const button = document.createElement("button");
+    button.className = "channel-open";
+    button.type = "button";
+    button.innerHTML = `
+      <span class="history-title">${channelTitle(channel)}</span>
+      <span class="channel-intro">${channelIntro(channel)}</span>
+      <span class="history-meta">${detail.join(" · ")}</span>
+    `;
+    button.addEventListener("click", () => loadChannel(channel.id));
+    item.append(checkbox, button);
+    channelList.appendChild(item);
+  });
+  updateChannelSelectionSummary();
+}
+
+function selectedChannels() {
+  return followedChannels.filter((channel) => selectedChannelIds.has(channel.id));
+}
+
+function updateChannelSelectionSummary() {
+  const count = selectedChannels().length;
+  discoverButton.textContent = count ? `查找已选 ${count} 个频道` : "选择频道后查找";
+}
+
+function renderChannelDetail(channel) {
+  activeChannel = channel;
+  refreshChannelButton.disabled = false;
+  renderChannelList(followedChannels);
+  channelDetail.innerHTML = "";
+  activeDiscoveryLabel.textContent = `频道内容 · ${channelTitle(channel)}`;
+  switchContentView("channel");
+
+  const head = document.createElement("div");
+  head.className = "channel-detail-head";
+  const title = document.createElement("div");
+  title.className = "channel-detail-title";
+  title.textContent = channelTitle(channel);
+  const intro = document.createElement("div");
+  intro.className = "channel-detail-intro";
+  intro.textContent = channelIntro(channel);
+  const meta = document.createElement("div");
+  meta.className = "history-meta";
+  meta.textContent = `${channel.video_count || 0} 个内容 · ${channel.known_date_count || 0} 个日期明确 · ${channel.unknown_date_count || 0} 个日期未知 · 更新 ${formatDateTime(channel.last_discovered_at || channel.updated_at)}`;
+  const copy = document.createElement("div");
+  copy.append(title, intro, meta);
+  head.appendChild(copy);
+
+  const actions = document.createElement("div");
+  actions.className = "channel-detail-actions";
+  const openLink = document.createElement("a");
+  openLink.className = "file-link";
+  openLink.href = channel.listing_url || channel.source_url || "#";
+  openLink.target = "_blank";
+  openLink.rel = "noreferrer";
+  openLink.textContent = "打开频道";
+  actions.appendChild(openLink);
+  if (channel.items && channel.items.length) {
+    const importButton = document.createElement("button");
+    importButton.className = "file-link";
+    importButton.type = "button";
+    importButton.textContent = "导入本频道";
+    importButton.addEventListener("click", () => {
+      urlInput.value = channel.items.map((item) => item.url).join("\n");
+      updateImportQueueSummary();
+      switchPage("extract");
+    });
+    actions.appendChild(importButton);
+  }
+  head.appendChild(actions);
+  channelDetail.appendChild(head);
+
+  if (channel.last_error) {
+    const error = document.createElement("div");
+    error.className = "message error";
+    error.textContent = channel.last_error;
+    channelDetail.appendChild(error);
+  }
+
+  const items = channel.items || [];
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "history-empty";
+    empty.textContent = "这个频道还没有内容记录，可以点击左侧“更新频道”。";
+    channelDetail.appendChild(empty);
+    return;
+  }
+
+  const list = document.createElement("div");
+  list.className = "channel-video-list";
+  items.forEach((video) => {
+    const row = document.createElement("a");
+    row.className = "channel-video-item";
+    row.href = video.url;
+    row.target = "_blank";
+    row.rel = "noreferrer";
+    row.innerHTML = `
+      <span class="channel-video-title">${video.title || video.url}</span>
+      <span class="history-meta">${video.publish_date || "日期未知"} · 视频 ${formatOptionalSeconds(video.duration_seconds)} · ${formatViews(video.view_count)}</span>
+    `;
+    list.appendChild(row);
+  });
+  channelDetail.appendChild(list);
+}
+
+async function loadChannels() {
+  try {
+    const response = await fetch("/api/channels");
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    renderChannelList(payload.channels || []);
+  } catch (error) {
+    channelList.innerHTML = `<div class="history-empty">${error.message}</div>`;
+  }
+}
+
+async function loadChannel(channelId) {
+  try {
+    const response = await fetch(`/api/channels/${encodeURIComponent(channelId)}`);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    renderChannelDetail(payload);
+  } catch (error) {
+    channelDetail.innerHTML = `<div class="history-empty">${error.message}</div>`;
+  }
+}
+
+async function addFollowedChannels() {
+  const sources = followInput.value.trim();
+  if (!sources) {
+    channelList.innerHTML = '<div class="history-empty">请输入要关注的频道主页</div>';
+    return;
+  }
+
+  addChannelsButton.disabled = true;
+  try {
+    const response = await fetch("/api/channels", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sources }),
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    followInput.value = "";
+    (payload.added || []).forEach((channel) => selectedChannelIds.add(channel.id));
+    renderChannelList(payload.channels || []);
+    channelDetail.innerHTML = `<div class="history-empty">新增 ${payload.added_count || 0} 个，已存在 ${payload.existing_count || 0} 个</div>`;
+  } catch (error) {
+    channelDetail.innerHTML = `<div class="history-empty">${error.message}</div>`;
+  } finally {
+    addChannelsButton.disabled = false;
+  }
+}
+
+async function refreshActiveChannel() {
+  if (!activeChannel) return;
+  refreshChannelButton.disabled = true;
+  channelDetail.innerHTML = '<div class="history-empty">正在更新频道内容</div>';
+  try {
+    const response = await fetch(`/api/channels/${encodeURIComponent(activeChannel.id)}/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        range: rangeInput.value.trim() || "1年",
+        max_per_source: Number(maxPerSourceInput.value || 120),
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    renderChannelList(payload.channels || []);
+    renderChannelDetail(payload.channel);
+    renderDiscoveryRecord(payload.record, { activateResults: false });
+    await loadDiscoveryHistory();
+  } catch (error) {
+    channelDetail.innerHTML = `<div class="history-empty">${error.message}</div>`;
+  } finally {
+    refreshChannelButton.disabled = !activeChannel;
+  }
+}
+
+function setDiscoveryBusy(isBusy, label = "查找视频") {
+  discoverButton.disabled = isBusy;
+  refreshDiscovery.disabled = isBusy || !activeDiscoveryRecord;
+  if (isBusy) {
+    discoverButton.textContent = "查找中";
+  } else if (label) {
+    updateChannelSelectionSummary();
+  }
+  serverState.textContent = isBusy ? "查找中" : "就绪";
+}
+
+function selectionKey(recordId) {
+  return `${DISCOVERY_SELECTION_PREFIX}${recordId}`;
+}
+
+function saveDiscoverySelection() {
+  if (!activeDiscoveryRecord) return;
+  localStorage.setItem(selectionKey(activeDiscoveryRecord.id), JSON.stringify(Array.from(selectedDiscoveryUrls)));
+  updateDiscoverySelectionSummary();
+}
+
+function loadDiscoverySelection(record) {
+  try {
+    const saved = JSON.parse(localStorage.getItem(selectionKey(record.id)) || "null");
+    if (Array.isArray(saved)) return new Set(saved);
+  } catch {
+    return new Set((record.items || []).map((item) => item.url));
+  }
+  return new Set((record.items || []).map((item) => item.url));
+}
+
+function selectedDiscoveryVideos() {
+  return discoveredVideos.filter((video) => selectedDiscoveryUrls.has(video.url));
+}
+
+function filteredDiscoveryVideos() {
+  const query = discoveryFilterInput.value.trim().toLowerCase();
+  if (!query) return discoveredVideos;
+  return discoveredVideos.filter((video) =>
+    [video.title, video.channel, video.url, video.source_title]
+      .some((value) => String(value || "").toLowerCase().includes(query))
+  );
+}
+
+function updateDiscoverySelectionSummary() {
+  const selectedCount = selectedDiscoveryVideos().length;
+  const totalCount = discoveredVideos.length;
+  const visibleCount = filteredDiscoveryVideos().length;
+  if (!totalCount) {
+    discoverySummary.textContent = "尚未发现视频";
+    return;
+  }
+  const summary = activeDiscoveryRecord?.summary || {};
+  const notes = [];
+  if (summary.unknown_date_count) notes.push(`${summary.unknown_date_count} 个日期未知`);
+  if (summary.limit_reached_count) notes.push(`${summary.limit_reached_count} 个频道达到上限`);
+  if (summary.error_count) notes.push(`${summary.error_count} 个频道失败`);
+  const filterText = visibleCount === totalCount ? "" : `，当前显示 ${visibleCount} 个`;
+  discoverySummary.textContent = `候选 ${totalCount} 个，已选 ${selectedCount} 个${filterText}${notes.length ? ` · ${notes.join(" · ")}` : ""}`;
+}
+
+function addDiscoveryPill(meta, text, className = "") {
+  const item = document.createElement("span");
+  item.className = `pill ${className}`.trim();
+  item.textContent = text;
+  meta.appendChild(item);
+}
+
+function renderDiscoveryCandidates() {
+  discoveryList.innerHTML = "";
+  const videos = filteredDiscoveryVideos();
+  if (!videos.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = discoveredVideos.length ? "没有匹配当前筛选的视频" : "在左侧查找频道后显示候选视频";
+    discoveryList.appendChild(empty);
+    updateDiscoverySelectionSummary();
+    return;
+  }
+
+  videos.forEach((video) => {
+    const item = document.createElement("article");
+    item.className = "discovery-item";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = selectedDiscoveryUrls.has(video.url);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) selectedDiscoveryUrls.add(video.url);
+      else selectedDiscoveryUrls.delete(video.url);
+      saveDiscoverySelection();
+    });
+
+    const info = document.createElement("div");
+    const title = document.createElement("a");
+    title.className = "discovery-title";
+    title.href = video.url;
+    title.target = "_blank";
+    title.rel = "noreferrer";
+    title.textContent = video.title || video.url;
+
+    const meta = document.createElement("div");
+    meta.className = "result-meta";
+    addDiscoveryPill(meta, video.publish_date || "日期未知", video.date_known ? "manual" : "automatic");
+    addDiscoveryPill(meta, `视频 ${formatOptionalSeconds(video.duration_seconds)}`);
+    addDiscoveryPill(meta, formatViews(video.view_count));
+    if (video.channel) addDiscoveryPill(meta, video.channel);
+
+    info.append(title, meta);
+    if (video.description) {
+      const description = document.createElement("div");
+      description.className = "discovery-description";
+      description.textContent = video.description;
+      info.appendChild(description);
+    }
+    if (video.source_title || video.source_url) {
+      const source = document.createElement("div");
+      source.className = "discovery-source";
+      source.textContent = video.source_title || video.source_url;
+      info.appendChild(source);
+    }
+
+    item.append(checkbox, info);
+    discoveryList.appendChild(item);
+  });
+  updateDiscoverySelectionSummary();
+}
+
+function renderDiscoveryRecord(record, options = {}) {
+  const activateResults = options.activateResults !== false;
+  activeDiscoveryRecord = record;
+  discoveredVideos = record.items || [];
+  selectedDiscoveryUrls = loadDiscoverySelection(record);
+  localStorage.setItem(ACTIVE_DISCOVERY_KEY, record.id);
+  if (activateResults) {
+    activeDiscoveryLabel.textContent = `记录 ${record.id} · 更新于 ${formatDateTime(record.updated_at)}`;
+  }
+  refreshDiscovery.disabled = false;
+  discoveryFilterInput.value = "";
+  renderDiscoveryCandidates();
+  if (activateResults) switchContentView("results");
+}
+
+async function discoverChannelVideos() {
+  const channels = selectedChannels();
+  if (!channels.length) {
+    discoverySummary.textContent = followedChannels.length ? "请先勾选要查找的频道" : "请先添加关注频道";
+    return;
+  }
+  const sources = channels.map((channel) => channel.source_url || channel.listing_url).join("\n");
+
+  setDiscoveryBusy(true);
+  switchContentView("results");
+  discoveryList.innerHTML = '<div class="empty-state">正在查找频道视频</div>';
+  discoverySummary.textContent = "查找中";
+
+  try {
+    const response = await fetch("/api/discover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sources,
+        range: rangeInput.value.trim() || "1年",
+        max_per_source: Number(maxPerSourceInput.value || 120),
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    renderDiscoveryRecord(payload);
+    await Promise.all([loadDiscoveryHistory(), loadChannels()]);
+  } catch (error) {
+    discoverySummary.textContent = "查找失败";
+    discoveryList.innerHTML = "";
+    const item = document.createElement("div");
+    item.className = "empty-state";
+    item.textContent = error.message;
+    discoveryList.appendChild(item);
+  } finally {
+    setDiscoveryBusy(false);
+  }
+}
+
+async function refreshActiveDiscovery() {
+  if (!activeDiscoveryRecord) return;
+  setDiscoveryBusy(true, "查找视频");
+  discoverySummary.textContent = "更新中";
+  try {
+    const response = await fetch(`/api/discoveries/${encodeURIComponent(activeDiscoveryRecord.id)}/refresh`, {
+      method: "POST",
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    renderDiscoveryRecord(payload);
+    await Promise.all([loadDiscoveryHistory(), loadChannels()]);
+  } catch (error) {
+    discoverySummary.textContent = `更新失败：${error.message}`;
+  } finally {
+    setDiscoveryBusy(false);
+  }
+}
+
+function selectDiscoveryVideos(checked) {
+  const videos = filteredDiscoveryVideos();
+  videos.forEach((video) => {
+    if (checked) selectedDiscoveryUrls.add(video.url);
+    else selectedDiscoveryUrls.delete(video.url);
+  });
+  saveDiscoverySelection();
+  renderDiscoveryCandidates();
+}
+
+function importSelectedDiscoveryUrls() {
+  const urls = selectedDiscoveryVideos().map((video) => video.url);
+  if (!urls.length) {
+    discoverySummary.textContent = "请先选择视频";
+    return false;
+  }
+  urlInput.value = urls.join("\n");
+  updateImportQueueSummary();
+  switchPage("extract");
+  urlInput.focus();
+  return true;
+}
+
+async function loadDiscoveryRecord(recordId) {
+  try {
+    const response = await fetch(`/api/discoveries/${encodeURIComponent(recordId)}`);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    renderDiscoveryRecord(payload);
+    switchPage("search");
+    return payload;
+  } catch (error) {
+    discoverySummary.textContent = `记录读取失败：${error.message}`;
+  }
+}
+
+function renderDiscoveryHistory(records) {
+  if (!records.length) {
+    discoveryHistoryList.innerHTML = '<div class="history-empty">暂无查找记录</div>';
+    return;
+  }
+  discoveryHistoryList.innerHTML = "";
+  records.forEach((record) => {
+    const item = document.createElement("button");
+    item.className = "history-item";
+    item.type = "button";
+    item.innerHTML = `
+      <span class="history-title">${record.source_titles?.[0] || record.sources?.[0] || record.id}</span>
+      <span class="history-meta">${record.video_count || 0} 个候选 · ${record.scanned_count || 0} 个已扫 · ${formatDateTime(record.updated_at)}</span>
+    `;
+    item.addEventListener("click", () => loadDiscoveryRecord(record.id));
+    discoveryHistoryList.appendChild(item);
+  });
+}
+
+async function loadDiscoveryHistory() {
+  try {
+    const response = await fetch("/api/discoveries");
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    renderDiscoveryHistory(payload.records || []);
+  } catch (error) {
+    discoveryHistoryList.innerHTML = `<div class="history-empty">${error.message}</div>`;
+  }
 }
 
 function fileUrl(jobId, filename) {
@@ -147,7 +762,8 @@ function renderFiles(job) {
       <span class="pill">${file.filename}</span>
       <span class="pill ${sourceClass}">${sourceText}:${file.subtitle_language || "unknown"}</span>
       <span class="pill">${formatSize(file.size_bytes)}</span>
-      <span class="pill">耗时 ${formatSeconds(file.elapsed_seconds)}</span>
+      <span class="pill">视频 ${formatOptionalSeconds(file.video_duration_seconds)}</span>
+      <span class="pill">提取耗时 ${formatSeconds(file.elapsed_seconds)}</span>
       <span class="pill">重试 ${file.retry_count || 0}</span>
       ${file.from_cache ? '<span class="pill manual">历史缓存</span>' : ""}
     `;
@@ -192,7 +808,7 @@ function renderJob(job) {
   }
   job.errors.forEach((error) => {
     appendError(
-      `${error.url}：${error.message}（耗时 ${formatSeconds(error.elapsed_seconds)}，重试 ${error.retry_count || 0}）`
+      `${error.url}：${error.message}（提取耗时 ${formatSeconds(error.elapsed_seconds)}，重试 ${error.retry_count || 0}）`
     );
   });
 
@@ -235,7 +851,7 @@ async function pollJob(jobId) {
 async function createJob() {
   const urls = urlInput.value.trim();
   if (!urls) {
-    setMessage("请输入视频 URL", "error");
+    setMessage("请先导入或输入视频 URL", "error");
     return;
   }
 
@@ -253,9 +869,11 @@ async function createJob() {
   summaryGrid.innerHTML = `
     <span>成功 0</span>
     <span>失败 0</span>
-    <span>平均耗时 0s</span>
+    <span>视频总长 0s</span>
+    <span>视频均长 0s</span>
+    <span>平均提取 0s</span>
+    <span>提取总耗时 0s</span>
     <span>平均重试 0</span>
-    <span>并发 0</span>
     <span>分批 -</span>
   `;
 
@@ -280,6 +898,7 @@ async function restoreJob(jobId) {
   selectedFileUrl = null;
   openPreview.classList.add("disabled");
   preview.textContent = "正在恢复历史任务";
+  switchPage("extract");
   const job = await pollJob(jobId);
   const done = job && (job.status === "completed" || job.status === "completed_with_errors");
   if (job && !done) startPolling(jobId);
@@ -298,7 +917,7 @@ function renderHistory(jobs) {
     const summary = job.summary || {};
     item.innerHTML = `
       <span class="history-title">${job.id} · ${statusText[job.status] || job.status}</span>
-      <span class="history-meta">${job.current || 0}/${job.total || 0} · 成功 ${summary.success_count || 0} · 失败 ${summary.error_count || 0} · 缓存 ${summary.cache_hit_count || 0}</span>
+      <span class="history-meta">${job.current || 0}/${job.total || 0} · 成功 ${summary.success_count || 0} · 失败 ${summary.error_count || 0} · 视频 ${formatSummaryVideoTotal(summary)} · 缓存 ${summary.cache_hit_count || 0}</span>
     `;
     item.addEventListener("click", () => restoreJob(job.id));
     historyList.appendChild(item);
@@ -318,19 +937,38 @@ async function loadHistory() {
 }
 
 async function init() {
-  await loadHistory();
+  pageTabs.forEach((tab) => tab.addEventListener("click", () => switchPage(tab.dataset.page)));
+  runButton.addEventListener("click", createJob);
+  refreshHistoryButton.addEventListener("click", loadHistory);
+  discoverButton.addEventListener("click", discoverChannelVideos);
+  refreshDiscovery.addEventListener("click", refreshActiveDiscovery);
+  refreshDiscoveryHistory.addEventListener("click", loadDiscoveryHistory);
+  refreshChannels.addEventListener("click", loadChannels);
+  addChannelsButton.addEventListener("click", addFollowedChannels);
+  refreshChannelButton.addEventListener("click", refreshActiveChannel);
+  selectAllDiscovery.addEventListener("click", () => selectDiscoveryVideos(true));
+  clearDiscoverySelection.addEventListener("click", () => selectDiscoveryVideos(false));
+  importDiscovery.addEventListener("click", importSelectedDiscoveryUrls);
+  discoveryFilterInput.addEventListener("input", renderDiscoveryCandidates);
+  urlInput.addEventListener("input", updateImportQueueSummary);
+  clearButton.addEventListener("click", () => {
+    urlInput.value = "";
+    updateImportQueueSummary();
+    urlInput.focus();
+  });
+
+  updateImportQueueSummary();
+  await Promise.all([loadHistory(), loadDiscoveryHistory(), loadChannels()]);
+
+  const activeDiscoveryId = localStorage.getItem(ACTIVE_DISCOVERY_KEY);
+  if (activeDiscoveryId) {
+    loadDiscoveryRecord(activeDiscoveryId);
+  }
+
   const active = localStorage.getItem(ACTIVE_JOB_KEY);
   if (active) {
     restoreJob(active);
   }
 }
-
-runButton.addEventListener("click", createJob);
-refreshHistoryButton.addEventListener("click", loadHistory);
-
-clearButton.addEventListener("click", () => {
-  urlInput.value = "";
-  urlInput.focus();
-});
 
 init();

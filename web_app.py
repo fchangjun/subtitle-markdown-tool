@@ -11,22 +11,28 @@ import uuid
 import zipfile
 import argparse
 import csv
+import hashlib
 import shutil
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import unquote, urlparse
 
+import yt_dlp
+
 from youtube_subtitles_to_md import (
     clean_scalar,
     enrich_youtube_oembed,
     extract_info,
+    extract_video_duration_seconds,
     fetch_transcript,
     format_date,
     looks_rate_limited_error,
     markdown_for_video,
+    parse_duration_seconds,
     rate_limit_detected_since,
     youtube_id_from_url,
 )
@@ -35,6 +41,9 @@ from youtube_subtitles_to_md import (
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 OUTPUT_DIR = ROOT / "web_outputs"
+DISCOVERY_DIR = OUTPUT_DIR / "discoveries"
+CHANNELS_DIR = OUTPUT_DIR / "channels"
+CHANNEL_INDEX_PATH = CHANNELS_DIR / "index.json"
 MAX_BODY_BYTES = 128 * 1024
 
 
@@ -60,6 +69,12 @@ TASK_RETRY_JITTER_SECONDS = max(0.0, env_float("SUBTITLE_TASK_RETRY_JITTER_SECON
 AUTO_BATCH_SIZE = max(0, env_int("SUBTITLE_AUTO_BATCH_SIZE", 30))
 AUTO_BATCH_COOLDOWN_SECONDS = max(0.0, env_float("SUBTITLE_AUTO_BATCH_COOLDOWN_SECONDS", 300.0))
 IP_BLOCK_COOLDOWN_SECONDS = max(0.0, env_float("SUBTITLE_IP_BLOCK_COOLDOWN_SECONDS", 900.0))
+DISCOVERY_MAX_SOURCES = max(1, env_int("SUBTITLE_DISCOVERY_MAX_SOURCES", 20))
+DISCOVERY_DEFAULT_MAX_PER_SOURCE = max(1, env_int("SUBTITLE_DISCOVERY_MAX_PER_SOURCE", 120))
+DISCOVERY_HARD_MAX_PER_SOURCE = max(
+    DISCOVERY_DEFAULT_MAX_PER_SOURCE,
+    env_int("SUBTITLE_DISCOVERY_HARD_MAX_PER_SOURCE", 1000),
+)
 
 
 @dataclass
@@ -74,6 +89,7 @@ class JobFile:
     size_bytes: int
     elapsed_seconds: float
     retry_count: int
+    video_duration_seconds: Optional[float] = None
     from_cache: bool = False
 
 
@@ -98,6 +114,7 @@ class Job:
 jobs: Dict[str, Job] = {}
 jobs_lock = threading.Lock()
 cache_lock = threading.Lock()
+channels_lock = threading.Lock()
 url_cache: Dict[str, Dict[str, object]] = {}
 
 
@@ -141,10 +158,575 @@ def parse_urls(raw: str) -> List[str]:
     return urls
 
 
+def parse_discovery_sources(raw: str) -> List[str]:
+    sources = parse_urls(raw)
+    if len(sources) > DISCOVERY_MAX_SOURCES:
+        raise ValueError(f"Too many channel URLs. Limit is {DISCOVERY_MAX_SOURCES} per discovery.")
+    return sources
+
+
+def subtract_months(value: date, months: int) -> date:
+    if months <= 0:
+        return value
+    month_index = value.year * 12 + value.month - 1 - months
+    year = month_index // 12
+    month = month_index % 12 + 1
+    month_lengths = [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    day = min(value.day, month_lengths[month - 1])
+    return date(year, month, day)
+
+
+def parse_discovery_range(value: str) -> date:
+    text = clean_scalar(value or "1年").lower()
+    unit_pattern = (
+        r"(\d+)\s*"
+        r"(years?|yrs?|y|年|months?|mos?|mo|m|个月|月|weeks?|w|周|天|日|days?|d)"
+    )
+    matches = re.findall(unit_pattern, text, flags=re.IGNORECASE)
+    if not matches:
+        raise ValueError("时间范围格式无效，请输入类似 1年、13个月、90天 或 1y 1m 1w。")
+
+    years = months = weeks = days = 0
+    for amount_text, unit in matches:
+        amount = int(amount_text)
+        unit = unit.lower()
+        if unit in {"year", "years", "yr", "yrs", "y", "年"}:
+            years += amount
+        elif unit in {"month", "months", "mos", "mo", "m", "个月", "月"}:
+            months += amount
+        elif unit in {"week", "weeks", "w", "周"}:
+            weeks += amount
+        elif unit in {"day", "days", "d", "天", "日"}:
+            days += amount
+
+    cutoff = subtract_months(date.today(), years * 12 + months)
+    return cutoff - timedelta(weeks=weeks, days=days)
+
+
+def discovery_listing_url(value: str) -> str:
+    parsed = urlparse(value)
+    host = parsed.netloc.lower()
+    if "youtube.com" not in host and not host.endswith("youtu.be"):
+        return value
+    if youtube_id_from_url(value):
+        return value
+
+    path = parsed.path.rstrip("/")
+    if not path:
+        return value
+    if path.endswith(("/videos", "/streams", "/shorts")):
+        return parsed._replace(path=path, query="", fragment="").geturl()
+    if path.startswith(("/@", "/channel/", "/c/", "/user/")):
+        return parsed._replace(path=f"{path}/videos", query="", fragment="").geturl()
+    return parsed._replace(query="", fragment="").geturl()
+
+
+def date_from_video_entry(entry: Dict[str, object]) -> Optional[date]:
+    upload_date = clean_scalar(entry.get("upload_date"))
+    if upload_date:
+        try:
+            return datetime.strptime(upload_date, "%Y%m%d").date()
+        except ValueError:
+            pass
+
+    for key in ["timestamp", "release_timestamp", "modified_timestamp"]:
+        timestamp = entry.get(key)
+        if timestamp is None:
+            continue
+        try:
+            return datetime.fromtimestamp(float(timestamp)).date()
+        except (TypeError, ValueError, OSError):
+            continue
+    return None
+
+
+def video_url_from_entry(entry: Dict[str, object]) -> str:
+    video_id = clean_scalar(entry.get("id"))
+    value = clean_scalar(entry.get("webpage_url") or entry.get("url"))
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+    if video_id:
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return value
+
+
+def number_or_none(value: object) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def discover_source_videos(source_url: str, cutoff_date: date, max_per_source: int) -> Dict[str, object]:
+    listing_url = discovery_listing_url(source_url)
+    is_single_video = bool(youtube_id_from_url(listing_url))
+    if is_single_video:
+        video_url = normalize_url(listing_url)
+        entry = {
+            "id": youtube_id_from_url(listing_url),
+            "url": video_url,
+            "title": video_url,
+            "channel": "",
+            "channel_url": "",
+            "publish_date": "",
+            "date_known": False,
+            "in_range": None,
+            "duration_seconds": None,
+            "view_count": None,
+            "description": "",
+            "source_url": source_url,
+        }
+        return {
+            "source_url": source_url,
+            "listing_url": listing_url,
+            "title": entry["title"],
+            "scanned_count": 1,
+            "included_count": 1,
+            "unknown_date_count": 1,
+            "limit_reached": False,
+            "items": [entry],
+        }
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": "in_playlist",
+        "playlistend": max_per_source,
+        "ignoreerrors": True,
+        "socket_timeout": 20,
+        "extractor_args": {"youtube": {"approximate_date": ["1"]}},
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(listing_url, download=False)
+
+    entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
+    items = []
+    unknown_date_count = 0
+    for entry in entries:
+        video_url = video_url_from_entry(entry)
+        if not video_url:
+            continue
+
+        publish_date = date_from_video_entry(entry)
+        date_known = publish_date is not None
+        in_range = publish_date >= cutoff_date if date_known else None
+        if date_known and not in_range:
+            continue
+        if not date_known:
+            unknown_date_count += 1
+
+        duration_seconds = extract_video_duration_seconds(entry)
+        items.append(
+            {
+                "id": clean_scalar(entry.get("id") or youtube_id_from_url(video_url)),
+                "url": video_url,
+                "title": clean_scalar(entry.get("title") or video_url),
+                "channel": clean_scalar(entry.get("channel") or entry.get("uploader") or info.get("channel") or info.get("uploader") or ""),
+                "channel_url": clean_scalar(entry.get("channel_url") or entry.get("uploader_url") or info.get("channel_url") or ""),
+                "publish_date": publish_date.isoformat() if publish_date else "",
+                "date_known": date_known,
+                "in_range": in_range,
+                "duration_seconds": round(duration_seconds, 3) if duration_seconds is not None else None,
+                "view_count": number_or_none(entry.get("view_count")),
+                "description": clean_scalar(entry.get("description") or ""),
+                "source_url": source_url,
+            }
+        )
+
+    return {
+        "source_url": source_url,
+        "listing_url": listing_url,
+        "title": clean_scalar(info.get("title") or listing_url),
+        "description": clean_scalar(info.get("description") or info.get("channel_description") or ""),
+        "scanned_count": len(entries),
+        "included_count": len(items),
+        "unknown_date_count": unknown_date_count,
+        "limit_reached": len(entries) >= max_per_source,
+        "items": items,
+    }
+
+
+def discover_videos(sources: List[str], range_text: str, max_per_source: int) -> Dict[str, object]:
+    cutoff_date = parse_discovery_range(range_text)
+    max_per_source = max(1, min(max_per_source, DISCOVERY_HARD_MAX_PER_SOURCE))
+
+    all_items = []
+    source_results = []
+    seen_urls = set()
+    for source_url in sources:
+        started = time.monotonic()
+        try:
+            result = discover_source_videos(source_url, cutoff_date, max_per_source)
+            result["elapsed_seconds"] = round(time.monotonic() - started, 3)
+            unique_items = []
+            for item in result.pop("items"):
+                key = normalize_url(item["url"])
+                if key in seen_urls:
+                    continue
+                seen_urls.add(key)
+                item["source_title"] = result.get("title", "")
+                unique_items.append(item)
+            result["included_count"] = len(unique_items)
+            all_items.extend(unique_items)
+            source_results.append(result)
+        except Exception as error:
+            source_results.append(
+                {
+                    "source_url": source_url,
+                    "listing_url": discovery_listing_url(source_url),
+                    "title": "",
+                    "scanned_count": 0,
+                    "included_count": 0,
+                    "unknown_date_count": 0,
+                    "limit_reached": False,
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "error": str(error),
+                }
+            )
+
+    all_items.sort(key=lambda item: item.get("publish_date") or "0000-00-00", reverse=True)
+    return {
+        "range": {
+            "input": range_text,
+            "cutoff_date": cutoff_date.isoformat(),
+        },
+        "max_per_source": max_per_source,
+        "items": all_items,
+        "sources": source_results,
+        "summary": {
+            "source_count": len(sources),
+            "video_count": len(all_items),
+            "scanned_count": sum(int(source.get("scanned_count") or 0) for source in source_results),
+            "unknown_date_count": sum(int(source.get("unknown_date_count") or 0) for source in source_results),
+            "error_count": sum(1 for source in source_results if source.get("error")),
+            "limit_reached_count": sum(1 for source in source_results if source.get("limit_reached")),
+        },
+    }
+
+
+def channel_listing_key(source_url: str) -> str:
+    return normalize_url(discovery_listing_url(source_url))
+
+
+def channel_id_for_key(key: str) -> str:
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+
+
+def safe_channel_id(value: str) -> str:
+    value = clean_scalar(value)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", value):
+        raise ValueError("Channel not found.")
+    return value
+
+
+def channel_content_path(channel_id: str) -> Path:
+    return CHANNELS_DIR / f"{safe_channel_id(channel_id)}.json"
+
+
+def load_channel_index() -> Dict[str, Dict[str, object]]:
+    if not CHANNEL_INDEX_PATH.exists():
+        return {}
+    try:
+        data = json.loads(CHANNEL_INDEX_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    channels = {}
+    for item in data.get("channels") or []:
+        if isinstance(item, dict) and item.get("id"):
+            channels[str(item["id"])] = item
+    return channels
+
+
+def save_channel_index(channels: Dict[str, Dict[str, object]]) -> None:
+    CHANNELS_DIR.mkdir(parents=True, exist_ok=True)
+    items = sorted(channels.values(), key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+    CHANNEL_INDEX_PATH.write_text(
+        json.dumps({"channels": items}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def channel_items_for(channel_id: str) -> List[Dict[str, object]]:
+    path = channel_content_path(channel_id)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return [item for item in (data.get("items") or []) if isinstance(item, dict)]
+
+
+def save_channel_items(channel_id: str, items: List[Dict[str, object]]) -> None:
+    CHANNELS_DIR.mkdir(parents=True, exist_ok=True)
+    channel_content_path(channel_id).write_text(
+        json.dumps({"items": items}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def channel_summary(channel: Dict[str, object]) -> Dict[str, object]:
+    return {
+        "id": channel.get("id", ""),
+        "source_url": channel.get("source_url", ""),
+        "listing_url": channel.get("listing_url", ""),
+        "title": channel.get("title") or channel.get("listing_url") or "",
+        "description": channel.get("description", ""),
+        "created_at": channel.get("created_at"),
+        "updated_at": channel.get("updated_at"),
+        "last_discovered_at": channel.get("last_discovered_at"),
+        "last_discovery_id": channel.get("last_discovery_id", ""),
+        "video_count": int(channel.get("video_count") or 0),
+        "known_date_count": int(channel.get("known_date_count") or 0),
+        "unknown_date_count": int(channel.get("unknown_date_count") or 0),
+        "scanned_count": int(channel.get("scanned_count") or 0),
+        "limit_reached": bool(channel.get("limit_reached", False)),
+        "last_error": clean_scalar(channel.get("last_error") or ""),
+    }
+
+
+def list_followed_channels() -> List[Dict[str, object]]:
+    with channels_lock:
+        return [channel_summary(channel) for channel in load_channel_index().values()]
+
+
+def upsert_followed_channel(source_url: str, channels: Optional[Dict[str, Dict[str, object]]] = None) -> Dict[str, object]:
+    listing_url = discovery_listing_url(source_url)
+    if youtube_id_from_url(listing_url):
+        raise ValueError("关注频道请输入博主主页或频道链接，不要输入单个视频链接。")
+    key = channel_listing_key(source_url)
+    channel_id = channel_id_for_key(key)
+    now = time.time()
+    target = channels if channels is not None else load_channel_index()
+    channel = target.get(channel_id)
+    if channel:
+        channel["updated_at"] = now
+        if source_url and source_url != channel.get("source_url"):
+            channel.setdefault("aliases", [])
+            aliases = list(channel.get("aliases") or [])
+            if source_url not in aliases:
+                aliases.append(source_url)
+            channel["aliases"] = aliases
+        return channel
+
+    channel = {
+        "id": channel_id,
+        "source_url": source_url,
+        "listing_url": key,
+        "title": key,
+        "description": "",
+        "created_at": now,
+        "updated_at": now,
+        "last_discovered_at": None,
+        "last_discovery_id": "",
+        "video_count": 0,
+        "known_date_count": 0,
+        "unknown_date_count": 0,
+        "scanned_count": 0,
+        "limit_reached": False,
+        "last_error": "",
+    }
+    target[channel_id] = channel
+    return channel
+
+
+def add_followed_channels(sources: List[str]) -> Dict[str, object]:
+    added = []
+    existing = []
+    with channels_lock:
+        channels = load_channel_index()
+        before = set(channels.keys())
+        for source_url in sources:
+            channel = upsert_followed_channel(source_url, channels)
+            if channel["id"] in before:
+                existing.append(channel_summary(channel))
+            else:
+                added.append(channel_summary(channel))
+                before.add(channel["id"])
+        save_channel_index(channels)
+    return {
+        "added_count": len(added),
+        "existing_count": len(existing),
+        "added": added,
+        "existing": existing,
+        "channels": list_followed_channels(),
+    }
+
+
+def update_followed_channels_from_discovery(record: Dict[str, object]) -> None:
+    with channels_lock:
+        channels = load_channel_index()
+        items = [item for item in (record.get("items") or []) if isinstance(item, dict)]
+        for source in record.get("sources") or []:
+            if not isinstance(source, dict):
+                continue
+            source_url = clean_scalar(source.get("source_url") or "")
+            if not source_url:
+                continue
+            try:
+                channel = upsert_followed_channel(source_url, channels)
+            except ValueError:
+                continue
+
+            source_key = channel_listing_key(source_url)
+            channel_items = [
+                item for item in items
+                if channel_listing_key(clean_scalar(item.get("source_url") or source_url)) == source_key
+            ]
+            channel["title"] = clean_scalar(source.get("title") or channel.get("title") or source_url)
+            if source.get("description"):
+                channel["description"] = clean_scalar(source.get("description"))
+            channel["updated_at"] = time.time()
+            channel["last_discovered_at"] = record.get("updated_at") or time.time()
+            channel["last_discovery_id"] = record.get("id", "")
+            channel["video_count"] = len(channel_items)
+            channel["known_date_count"] = sum(1 for item in channel_items if item.get("date_known"))
+            channel["unknown_date_count"] = int(source.get("unknown_date_count") or 0)
+            channel["scanned_count"] = int(source.get("scanned_count") or 0)
+            channel["limit_reached"] = bool(source.get("limit_reached", False))
+            channel["last_error"] = clean_scalar(source.get("error") or "")
+            save_channel_items(str(channel["id"]), channel_items)
+        save_channel_index(channels)
+
+
+def get_followed_channel(channel_id: str) -> Dict[str, object]:
+    with channels_lock:
+        channels = load_channel_index()
+        channel = channels.get(safe_channel_id(channel_id))
+        if not channel:
+            raise ValueError("Channel not found.")
+        payload = channel_summary(channel)
+        payload["items"] = channel_items_for(str(payload["id"]))
+        return payload
+
+
+def refresh_followed_channel(channel_id: str, range_text: str, max_per_source: int) -> Dict[str, object]:
+    channel = get_followed_channel(channel_id)
+    source = clean_scalar(channel.get("source_url") or channel.get("listing_url"))
+    record = create_discovery_record([source], range_text, max_per_source)
+    return {
+        "record": record,
+        "channel": get_followed_channel(channel_id),
+        "channels": list_followed_channels(),
+    }
+
+
+def safe_discovery_id(value: str) -> str:
+    value = clean_scalar(value)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", value):
+        raise ValueError("Discovery record not found.")
+    return value
+
+
+def discovery_record_path(record_id: str) -> Path:
+    return DISCOVERY_DIR / f"{safe_discovery_id(record_id)}.json"
+
+
+def discovery_record_summary(record: Dict[str, object]) -> Dict[str, object]:
+    summary = dict(record.get("summary") or {})
+    return {
+        "id": record.get("id", ""),
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
+        "range": record.get("range"),
+        "max_per_source": record.get("max_per_source"),
+        "source_count": summary.get("source_count", 0),
+        "video_count": summary.get("video_count", 0),
+        "scanned_count": summary.get("scanned_count", 0),
+        "unknown_date_count": summary.get("unknown_date_count", 0),
+        "error_count": summary.get("error_count", 0),
+        "limit_reached_count": summary.get("limit_reached_count", 0),
+        "sources": record.get("sources_input") or [],
+        "source_titles": [
+            clean_scalar(source.get("title") or source.get("source_url") or "")
+            for source in (record.get("sources") or [])[:4]
+            if isinstance(source, dict)
+        ],
+        "refresh_count": record.get("refresh_count", 0),
+    }
+
+
+def persist_discovery_record(record: Dict[str, object]) -> None:
+    DISCOVERY_DIR.mkdir(parents=True, exist_ok=True)
+    discovery_record_path(str(record["id"])).write_text(
+        json.dumps(record, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_discovery_record(record_id: str) -> Dict[str, object]:
+    path = discovery_record_path(record_id)
+    if not path.exists():
+        raise ValueError("Discovery record not found.")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def list_discovery_records() -> List[Dict[str, object]]:
+    if not DISCOVERY_DIR.exists():
+        return []
+    records = []
+    for path in DISCOVERY_DIR.glob("*.json"):
+        try:
+            records.append(discovery_record_summary(json.loads(path.read_text(encoding="utf-8"))))
+        except Exception:
+            continue
+    records.sort(key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+    return records
+
+
+def create_discovery_record(sources: List[str], range_text: str, max_per_source: int) -> Dict[str, object]:
+    record = discover_videos(sources, range_text, max_per_source)
+    now = time.time()
+    record.update(
+        {
+            "id": uuid.uuid4().hex[:12],
+            "created_at": now,
+            "updated_at": now,
+            "sources_input": sources,
+            "range_input": range_text,
+            "refresh_count": 0,
+        }
+    )
+    persist_discovery_record(record)
+    update_followed_channels_from_discovery(record)
+    return record
+
+
+def refresh_discovery_record(record_id: str) -> Dict[str, object]:
+    previous = load_discovery_record(record_id)
+    sources = [clean_scalar(source) for source in (previous.get("sources_input") or []) if clean_scalar(source)]
+    range_text = clean_scalar(previous.get("range_input") or (previous.get("range") or {}).get("input") or "1年")
+    max_per_source = int(previous.get("max_per_source") or DISCOVERY_DEFAULT_MAX_PER_SOURCE)
+    record = discover_videos(sources, range_text, max_per_source)
+    now = time.time()
+    record.update(
+        {
+            "id": safe_discovery_id(record_id),
+            "created_at": previous.get("created_at") or now,
+            "updated_at": now,
+            "sources_input": sources,
+            "range_input": range_text,
+            "refresh_count": int(previous.get("refresh_count") or 0) + 1,
+            "previous_updated_at": previous.get("updated_at"),
+        }
+    )
+    persist_discovery_record(record)
+    update_followed_channels_from_discovery(record)
+    return record
+
+
 def job_to_dict(job: Job) -> Dict:
     files = sorted(job.files, key=lambda file: file.filename)
     elapsed_values = [file.elapsed_seconds for file in files]
     elapsed_values.extend(float(error.get("elapsed_seconds", 0)) for error in job.errors)
+    video_duration_values = [
+        file.video_duration_seconds
+        for file in files
+        if file.video_duration_seconds is not None
+    ]
     retry_values = [file.retry_count for file in files]
     retry_values.extend(int(error.get("retry_count", 0)) for error in job.errors)
     completed_count = len(elapsed_values)
@@ -173,8 +755,17 @@ def job_to_dict(job: Job) -> Dict:
             "success_count": len(job.files),
             "error_count": len(job.errors),
             "average_elapsed_seconds": round(sum(elapsed_values) / completed_count, 3) if completed_count else 0,
+            "average_video_duration_seconds": (
+                round(sum(video_duration_values) / len(video_duration_values), 3)
+                if video_duration_values
+                else None
+            ),
             "average_retry_count": round(sum(retry_values) / completed_count, 3) if completed_count else 0,
             "total_item_elapsed_seconds": round(sum(elapsed_values), 3),
+            "total_video_duration_seconds": (
+                round(sum(video_duration_values), 3) if video_duration_values else None
+            ),
+            "video_duration_known_count": len(video_duration_values),
             "wall_elapsed_seconds": wall_time,
             "worker_count": 1 if job.total else 0,
             "cache_hit_count": cache_hit_count,
@@ -302,6 +893,7 @@ def write_job_artifacts(job: Job) -> None:
                 "subtitle_source",
                 "subtitle_language",
                 "size_bytes",
+                "video_duration_seconds",
                 "elapsed_seconds",
                 "retry_count",
                 "from_cache",
@@ -321,6 +913,7 @@ def write_job_artifacts(job: Job) -> None:
                     "subtitle_source": file.subtitle_source,
                     "subtitle_language": file.subtitle_language,
                     "size_bytes": file.size_bytes,
+                    "video_duration_seconds": file.video_duration_seconds if file.video_duration_seconds is not None else "",
                     "elapsed_seconds": file.elapsed_seconds,
                     "retry_count": file.retry_count,
                     "from_cache": file.from_cache,
@@ -339,6 +932,7 @@ def write_job_artifacts(job: Job) -> None:
                     "subtitle_source": "",
                     "subtitle_language": "",
                     "size_bytes": "",
+                    "video_duration_seconds": "",
                     "elapsed_seconds": error.get("elapsed_seconds", 0),
                     "retry_count": error.get("retry_count", 0),
                     "from_cache": "",
@@ -384,6 +978,7 @@ def job_from_manifest(path: Path) -> Optional[Job]:
                     size_bytes=int(item.get("size_bytes") or 0),
                     elapsed_seconds=float(item.get("elapsed_seconds") or 0),
                     retry_count=int(item.get("retry_count") or 0),
+                    video_duration_seconds=parse_duration_seconds(item.get("video_duration_seconds")),
                     from_cache=bool(item.get("from_cache", False)),
                 )
             )
@@ -428,6 +1023,7 @@ def process_url(url: str, index: int, output_dir: Path, retry_counter: List[int]
     info = extract_info(url)
     info = enrich_youtube_oembed(info, url)
     transcript, lang, source_name = fetch_transcript(info, url, retry_counter=retry_counter)
+    video_duration_seconds = extract_video_duration_seconds(info)
 
     video_id = clean_scalar(info.get("id") or youtube_id_from_url(url) or f"{index:04d}")
     safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", video_id).strip("._") or f"{index:04d}"
@@ -446,6 +1042,7 @@ def process_url(url: str, index: int, output_dir: Path, retry_counter: List[int]
         size_bytes=path.stat().st_size,
         elapsed_seconds=0,
         retry_count=retry_counter[0],
+        video_duration_seconds=round(video_duration_seconds, 3) if video_duration_seconds is not None else None,
     )
 
 
@@ -497,6 +1094,7 @@ def process_cached_url(url: str, index: int, output_dir: Path) -> Optional[JobFi
         size_bytes=target_path.stat().st_size,
         elapsed_seconds=0,
         retry_count=0,
+        video_duration_seconds=source_file.video_duration_seconds,
         from_cache=True,
     )
 
@@ -632,6 +1230,14 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.serve_static(path.removeprefix("/static/"))
         if path == "/api/jobs":
             return self.handle_jobs_list()
+        if path == "/api/channels":
+            return self.handle_channels_list()
+        if path.startswith("/api/channels/"):
+            return self.handle_channel_get(path)
+        if path == "/api/discoveries":
+            return self.handle_discoveries_list()
+        if path.startswith("/api/discoveries/"):
+            return self.handle_discovery_get(path)
         if path.startswith("/api/jobs/"):
             return self.handle_job_get(path)
         return self.send_error(HTTPStatus.NOT_FOUND)
@@ -641,6 +1247,14 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/jobs":
             return self.handle_create_job()
+        if parsed.path == "/api/channels":
+            return self.handle_add_channels()
+        if parsed.path.startswith("/api/channels/"):
+            return self.handle_channel_post(parsed.path)
+        if parsed.path == "/api/discover":
+            return self.handle_discover()
+        if parsed.path.startswith("/api/discoveries/"):
+            return self.handle_discovery_post(parsed.path)
         return self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_HEAD(self):
@@ -653,17 +1267,23 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.serve_static(path.removeprefix("/static/"))
         return self.send_error(HTTPStatus.NOT_FOUND)
 
-    def handle_create_job(self):
+    def read_json_body(self) -> Dict[str, object]:
         length = int(self.headers.get("Content-Length", "0"))
         if length > MAX_BODY_BYTES:
-            return self.send_json({"error": "Request body is too large."}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            raise ValueError("Request body is too large.")
+        body = self.rfile.read(length)
+        return json.loads(body.decode("utf-8") or "{}")
+
+    def handle_create_job(self):
         try:
-            body = self.rfile.read(length)
-            payload = json.loads(body.decode("utf-8") or "{}")
+            payload = self.read_json_body()
             raw_urls = payload.get("urls", "")
             if isinstance(raw_urls, list):
                 raw_urls = "\n".join(str(item) for item in raw_urls)
             urls = parse_urls(str(raw_urls))
+        except ValueError as error:
+            status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE if "too large" in str(error) else HTTPStatus.BAD_REQUEST
+            return self.send_json({"error": str(error)}, status)
         except Exception as error:
             return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
 
@@ -676,6 +1296,92 @@ class AppHandler(BaseHTTPRequestHandler):
         thread = threading.Thread(target=process_job, args=(job_id,), daemon=True)
         thread.start()
         return self.send_json(job_to_dict(job), HTTPStatus.CREATED)
+
+    def handle_channels_list(self):
+        return self.send_json({"channels": list_followed_channels()})
+
+    def handle_channel_get(self, path: str):
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) != 3:
+            return self.send_error(HTTPStatus.NOT_FOUND)
+        try:
+            return self.send_json(get_followed_channel(parts[2]))
+        except ValueError as error:
+            return self.send_json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+        except Exception as error:
+            return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+
+    def handle_add_channels(self):
+        try:
+            payload = self.read_json_body()
+            raw_sources = payload.get("sources", "")
+            if isinstance(raw_sources, list):
+                raw_sources = "\n".join(str(item) for item in raw_sources)
+            sources = parse_discovery_sources(str(raw_sources))
+            result = add_followed_channels(sources)
+        except ValueError as error:
+            status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE if "too large" in str(error) else HTTPStatus.BAD_REQUEST
+            return self.send_json({"error": str(error)}, status)
+        except Exception as error:
+            return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        return self.send_json(result, HTTPStatus.CREATED)
+
+    def handle_channel_post(self, path: str):
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 4 and parts[3] == "refresh":
+            try:
+                payload = self.read_json_body()
+                range_text = clean_scalar(payload.get("range") or "1年")
+                max_per_source = int(payload.get("max_per_source") or DISCOVERY_DEFAULT_MAX_PER_SOURCE)
+                return self.send_json(refresh_followed_channel(parts[2], range_text, max_per_source))
+            except ValueError as error:
+                return self.send_json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+            except Exception as error:
+                return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        return self.send_error(HTTPStatus.NOT_FOUND)
+
+    def handle_discover(self):
+        try:
+            payload = self.read_json_body()
+            raw_sources = payload.get("sources", "")
+            if isinstance(raw_sources, list):
+                raw_sources = "\n".join(str(item) for item in raw_sources)
+            sources = parse_discovery_sources(str(raw_sources))
+            range_text = clean_scalar(payload.get("range") or "1年")
+            max_per_source = int(payload.get("max_per_source") or DISCOVERY_DEFAULT_MAX_PER_SOURCE)
+            result = create_discovery_record(sources, range_text, max_per_source)
+        except ValueError as error:
+            status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE if "too large" in str(error) else HTTPStatus.BAD_REQUEST
+            return self.send_json({"error": str(error)}, status)
+        except Exception as error:
+            return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        return self.send_json(result)
+
+    def handle_discoveries_list(self):
+        return self.send_json({"records": list_discovery_records()[:80]})
+
+    def handle_discovery_get(self, path: str):
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) != 3:
+            return self.send_error(HTTPStatus.NOT_FOUND)
+        try:
+            record = load_discovery_record(parts[2])
+        except ValueError as error:
+            return self.send_json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+        except Exception as error:
+            return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        return self.send_json(record)
+
+    def handle_discovery_post(self, path: str):
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 4 and parts[3] == "refresh":
+            try:
+                return self.send_json(refresh_discovery_record(parts[2]))
+            except ValueError as error:
+                return self.send_json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+            except Exception as error:
+                return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        return self.send_error(HTTPStatus.NOT_FOUND)
 
     def handle_jobs_list(self):
         with jobs_lock:

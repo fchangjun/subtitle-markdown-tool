@@ -174,6 +174,45 @@ def format_date(upload_date: Optional[str]) -> str:
         return upload_date
 
 
+def parse_duration_seconds(value: object) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value >= 0 else None
+
+    text = clean_scalar(value)
+    if not text:
+        return None
+    try:
+        number = float(text)
+        return number if number >= 0 else None
+    except ValueError:
+        pass
+
+    parts = text.split(":")
+    if not 1 <= len(parts) <= 3:
+        return None
+    total = 0.0
+    for part in parts:
+        if not re.fullmatch(r"\d+(?:\.\d+)?", part):
+            return None
+        total = total * 60 + float(part)
+    return total
+
+
+def extract_video_duration_seconds(info: Dict) -> Optional[float]:
+    for key in ["duration", "duration_seconds"]:
+        seconds = parse_duration_seconds(info.get(key))
+        if seconds is not None:
+            return seconds
+
+    approx_duration_ms = parse_duration_seconds(info.get("approx_duration_ms"))
+    if approx_duration_ms is not None:
+        return approx_duration_ms / 1000
+
+    return parse_duration_seconds(info.get("duration_string"))
+
+
 def canonical_youtube_url(info: Dict, fallback_url: str) -> str:
     video_id = info.get("id") or youtube_id_from_url(fallback_url)
     if video_id:
@@ -422,6 +461,7 @@ def markdown_for_video(info: Dict, url: str, index: int, transcript: str) -> str
     article_id = f"{slug_part(uploader)}_{date_for_id}_{index:04d}"
     source_url = canonical_youtube_url(info, url)
     title = clean_scalar(info.get("title") or info.get("fulltitle") or source_url)
+    duration_seconds = extract_video_duration_seconds(info)
 
     header = [
         f"article_id: {article_id}",
@@ -430,6 +470,8 @@ def markdown_for_video(info: Dict, url: str, index: int, transcript: str) -> str
         f"publish_date: {publish_date}",
         f"source_url: {source_url}",
     ]
+    if duration_seconds is not None:
+        header.append(f"video_duration_seconds: {round(duration_seconds, 3)}")
     body = transcript.strip() or "未抓取到字幕正文。"
     return "\n".join(header) + "\n\n# 字幕逐字稿\n\n" + body + "\n"
 

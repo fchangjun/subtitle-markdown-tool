@@ -87,6 +87,18 @@ python web_app.py --host 127.0.0.1 --port 8765
 python youtube_subtitles_to_md.py "https://www.youtube.com/watch?v=VIDEO_ID" -o markdown
 ```
 
+## 频道发现
+
+Web 页面分为“查找”和“导入下载”两个页面。“查找”页先维护关注频道库，例如添加 `https://www.youtube.com/@Figma`；查找时勾选要参与的频道，再选择 `1年`、`13个月`、`90天`、`1年1个月1周` 这类时间范围发现候选视频。候选结果默认全选，可以取消部分视频后导入到“导入下载”页。
+
+“查找”页还会维护一个关注频道库。可以添加新的博主主页，系统会按规范化后的频道 `/videos` 链接去重，因此同一频道重复添加不会生成多条记录。点击关注频道可以查看该频道已有内容数量、最近更新时间、日期未知数量和已抓到的视频列表；也可以单独更新该频道。
+
+每次查找都会保存为一条查找记录，记录保存在 `web_outputs/discoveries/`。之后可以从“查找记录”打开历史结果，也可以点击“更新当前记录”，用同样的频道和时间范围重新抓取候选视频。
+
+关注频道数据保存在 `web_outputs/channels/`。
+
+发现阶段会优先使用频道列表里的轻量信息。YouTube 有些频道列表不会返回发布日期、时长或简介，这类视频会标记为“日期未知”并保留在候选列表里，避免误删可能符合范围的视频。
+
 ## 降低限流 / 封 IP 风险
 
 工具默认启用慢速模式：Web 任务串行处理，每次外部请求之间会等待一段时间；检测到 403、429、验证码、not a bot、too many requests 等疑似限流信号后，会自动长时间退避。
@@ -115,6 +127,11 @@ export SUBTITLE_IP_BLOCK_COOLDOWN_SECONDS=900
 # 单条任务失败后的任务级重试退避
 export SUBTITLE_TASK_RETRY_BASE_SECONDS=15
 export SUBTITLE_TASK_RETRY_MAX_SECONDS=180
+
+# 频道发现：每次最多输入 20 个频道，每频道默认扫描前 120 条，硬上限 1000 条
+export SUBTITLE_DISCOVERY_MAX_SOURCES=20
+export SUBTITLE_DISCOVERY_MAX_PER_SOURCE=120
+export SUBTITLE_DISCOVERY_HARD_MAX_PER_SOURCE=1000
 ```
 
 如果仍然频繁触发封禁，可以把 `SUBTITLE_REQUEST_MIN_INTERVAL_SECONDS` 调到 `15` 或 `30`，或者把 `SUBTITLE_AUTO_BATCH_SIZE` 调小、`SUBTITLE_AUTO_BATCH_COOLDOWN_SECONDS` 调大。
@@ -126,6 +143,8 @@ Web 页面生成的任务结果默认保存在：
 ```text
 web_outputs/
 ```
+
+每个任务目录会包含 `job_summary.json` 和 `job_metrics.csv`；其中会记录单条视频时长、总视频时长、提取耗时、重试次数、字幕来源等统计信息。
 
 命令行脚本默认输出到：
 

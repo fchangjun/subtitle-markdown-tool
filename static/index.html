@@ -4,98 +4,209 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>视频字幕转 Markdown</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260702-no-content-tabs" />
   </head>
   <body>
     <header class="topbar">
       <div>
-        <h1>视频字幕转 Markdown</h1>
-        <p>URL 批量处理台</p>
+        <h1>视频资料工作台</h1>
+        <p>查找频道视频，导入字幕提取，下载 Markdown</p>
       </div>
+      <nav class="page-tabs" aria-label="主页面">
+        <button class="tab-button active" id="searchTab" type="button" data-page="search">查找</button>
+        <button class="tab-button" id="extractTab" type="button" data-page="extract">导入下载</button>
+      </nav>
       <div class="server-state" id="serverState">
         <span class="dot"></span>
         <span>就绪</span>
       </div>
     </header>
 
-    <main class="workspace">
-      <section class="input-pane" aria-labelledby="inputTitle">
-        <div class="section-head">
-          <div>
-            <h2 id="inputTitle">输入</h2>
-            <p>每行一个视频链接</p>
-          </div>
-          <span class="limit">最多 1000 条</span>
-        </div>
+    <main>
+      <section class="page active" id="searchPage" aria-labelledby="searchTitle">
+        <div class="search-layout">
+          <aside class="panel search-form-pane">
+            <div class="section-head">
+              <div>
+                <h2 id="searchTitle">频道查找</h2>
+                <p>保存查找记录，可随时更新</p>
+              </div>
+              <span class="limit">最多 20 个频道</span>
+            </div>
 
-        <label class="field-label" for="urlInput">视频 URL</label>
-        <textarea id="urlInput" spellcheck="false">https://www.youtube.com/watch?v=gv0WHhKelSE
+            <div class="follow-block">
+              <div class="history-head">
+                <h2>关注频道</h2>
+                <button class="secondary small" id="refreshChannels" type="button">刷新</button>
+              </div>
+              <textarea id="followInput" class="follow-textarea" spellcheck="false" placeholder="新增关注频道，一行一个主页链接"></textarea>
+              <div class="actions compact-actions">
+                <button class="secondary small" id="addChannelsButton" type="button">添加关注</button>
+                <button class="secondary small" id="refreshChannelButton" type="button" disabled>更新频道</button>
+              </div>
+              <div class="channel-list" id="channelList">
+                <div class="history-empty">暂无关注频道</div>
+              </div>
+            </div>
+
+            <div class="discovery-controls">
+              <label>
+                <span>时间范围</span>
+                <select id="rangeInput">
+                  <option value="1周">最近 1 周</option>
+                  <option value="1个月">最近 1 个月</option>
+                  <option value="3个月">最近 3 个月</option>
+                  <option value="6个月">最近 6 个月</option>
+                  <option value="1年" selected>最近 1 年</option>
+                  <option value="1年1个月1周">最近 1 年 1 个月 1 周</option>
+                  <option value="2年">最近 2 年</option>
+                  <option value="5年">最近 5 年</option>
+                </select>
+              </label>
+              <label>
+                <span>每频道上限</span>
+                <select id="maxPerSourceInput">
+                  <option value="20">20 条</option>
+                  <option value="50">50 条</option>
+                  <option value="120" selected>120 条</option>
+                  <option value="300">300 条</option>
+                  <option value="500">500 条</option>
+                  <option value="1000">1000 条</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="actions">
+              <button class="primary" id="discoverButton" type="button">查找勾选频道</button>
+              <button class="secondary" id="refreshDiscovery" type="button" disabled>更新当前记录</button>
+            </div>
+
+            <div class="history-block compact-history">
+              <div class="history-head">
+                <h2>查找记录</h2>
+                <button class="secondary small" id="refreshDiscoveryHistory" type="button">刷新</button>
+              </div>
+              <div class="history-list discovery-history-list" id="discoveryHistoryList">
+                <div class="history-empty">暂无查找记录</div>
+              </div>
+            </div>
+          </aside>
+
+          <section class="panel candidates-pane">
+            <div class="section-head">
+              <div>
+                <h2>内容查看</h2>
+                <p id="activeDiscoveryLabel">尚未选择查找记录或频道</p>
+              </div>
+              <div class="section-actions" id="discoveryActions">
+                <button class="secondary small" id="selectAllDiscovery" type="button">全选</button>
+                <button class="secondary small" id="clearDiscoverySelection" type="button">取消选择</button>
+                <button class="primary small" id="importDiscovery" type="button">导入已选</button>
+              </div>
+            </div>
+
+            <div class="candidate-status" id="discoveryStatus">
+              <div id="discoverySummary">尚未发现视频</div>
+              <label class="filter-field">
+                <span>筛选</span>
+                <input id="discoveryFilterInput" type="search" placeholder="标题、频道或 URL" />
+              </label>
+            </div>
+
+            <div class="channel-detail content-panel" id="channelDetail" hidden>
+              <div class="history-empty">选择一个关注频道查看已有内容</div>
+            </div>
+
+            <div class="discovery-list large content-panel" id="discoveryList">
+              <div class="empty-state">在左侧查找频道后显示候选视频</div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="page" id="extractPage" aria-labelledby="extractTitle">
+        <div class="workspace">
+          <section class="input-pane" aria-labelledby="extractTitle">
+            <div class="section-head">
+              <div>
+                <h2 id="extractTitle">导入下载</h2>
+                <p id="importQueueSummary">待提取队列为空</p>
+              </div>
+              <span class="limit">最多 1000 条</span>
+            </div>
+
+            <label class="field-label" for="urlInput">待提取视频 URL</label>
+            <textarea id="urlInput" spellcheck="false">https://www.youtube.com/watch?v=gv0WHhKelSE
 https://youtu.be/fGKNUvivvnc?list=PLf2m23nhTg1NxGVFS4ktbFfAVy3Dz2kPd
 https://www.youtube.com/watch?v=f6SIJDGGjuY</textarea>
 
-        <div class="actions">
-          <button class="primary" id="runButton" type="button">
-            <span class="button-icon">▶</span>
-            <span>开始处理</span>
-          </button>
-          <button class="secondary" id="clearButton" type="button">
-            <span class="button-icon">×</span>
-            <span>清空</span>
-          </button>
-        </div>
+            <div class="actions">
+              <button class="primary" id="runButton" type="button">
+                <span class="button-icon">▶</span>
+                <span>开始提取</span>
+              </button>
+              <button class="secondary" id="clearButton" type="button">
+                <span class="button-icon">×</span>
+                <span>清空队列</span>
+              </button>
+            </div>
 
-        <div class="progress-block">
-          <div class="progress-copy">
-            <span id="progressLabel">等待任务</span>
-            <span id="progressCount">0 / 0</span>
-          </div>
-          <div class="progress-track" aria-hidden="true">
-            <div id="progressBar"></div>
-          </div>
-          <div class="summary-grid" id="summaryGrid">
-            <span>成功 0</span>
-            <span>失败 0</span>
-            <span>平均耗时 0s</span>
-            <span>平均重试 0</span>
-            <span>并发 0</span>
-            <span>分批 -</span>
-          </div>
-        </div>
+            <div class="progress-block">
+              <div class="progress-copy">
+                <span id="progressLabel">等待任务</span>
+                <span id="progressCount">0 / 0</span>
+              </div>
+              <div class="progress-track" aria-hidden="true">
+                <div id="progressBar"></div>
+              </div>
+              <div class="summary-grid" id="summaryGrid">
+                <span>成功 0</span>
+                <span>失败 0</span>
+                <span>视频总长 0s</span>
+                <span>视频均长 0s</span>
+                <span>平均提取 0s</span>
+                <span>提取总耗时 0s</span>
+                <span>平均重试 0</span>
+                <span>分批 -</span>
+              </div>
+            </div>
 
-        <div class="messages" id="messages"></div>
+            <div class="messages" id="messages"></div>
 
-        <div class="history-block">
-          <div class="history-head">
-            <h2>历史任务</h2>
-            <button class="secondary small" id="refreshHistoryButton" type="button">刷新</button>
-          </div>
-          <div class="history-list" id="historyList">
-            <div class="history-empty">暂无历史任务</div>
-          </div>
-        </div>
-      </section>
+            <div class="history-block">
+              <div class="history-head">
+                <h2>提取任务</h2>
+                <button class="secondary small" id="refreshHistoryButton" type="button">刷新</button>
+              </div>
+              <div class="history-list" id="historyList">
+                <div class="history-empty">暂无历史任务</div>
+              </div>
+            </div>
+          </section>
 
-      <section class="results-pane" aria-labelledby="resultsTitle">
-        <div class="section-head">
-          <div>
-            <h2 id="resultsTitle">结果</h2>
-            <p id="jobLabel">尚未创建任务</p>
-          </div>
-          <a class="download-all disabled" id="downloadAll" href="#" aria-disabled="true">下载 ZIP</a>
-        </div>
+          <section class="results-pane" aria-labelledby="resultsTitle">
+            <div class="section-head">
+              <div>
+                <h2 id="resultsTitle">结果</h2>
+                <p id="jobLabel">尚未创建任务</p>
+              </div>
+              <a class="download-all disabled" id="downloadAll" href="#" aria-disabled="true">下载 ZIP</a>
+            </div>
 
-        <div class="result-list" id="resultList">
-          <div class="empty-state">处理完成后显示 Markdown 文件</div>
-        </div>
+            <div class="result-list" id="resultList">
+              <div class="empty-state">处理完成后显示 Markdown 文件</div>
+            </div>
 
-        <div class="preview-head">
-          <h2>预览</h2>
-          <a id="openPreview" class="preview-link disabled" href="#" target="_blank" rel="noreferrer">打开文件</a>
+            <div class="preview-head">
+              <h2>预览</h2>
+              <a id="openPreview" class="preview-link disabled" href="#" target="_blank" rel="noreferrer">打开文件</a>
+            </div>
+            <pre class="preview" id="preview">选择一个结果查看 Markdown</pre>
+          </section>
         </div>
-        <pre class="preview" id="preview">选择一个结果查看 Markdown</pre>
       </section>
     </main>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260702-no-content-tabs"></script>
   </body>
 </html>
