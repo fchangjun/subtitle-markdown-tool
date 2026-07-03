@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>视频字幕转 Markdown</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260702-no-content-tabs" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260703-source-progress" />
   </head>
   <body>
     <header class="topbar">
@@ -29,7 +29,7 @@
             <div class="section-head">
               <div>
                 <h2 id="searchTitle">频道查找</h2>
-                <p>保存查找记录，可随时更新</p>
+                <p>批量扫描后按频道保存内容</p>
               </div>
               <span class="limit">最多 20 个频道</span>
             </div>
@@ -74,20 +74,41 @@
                   <option value="1000">1000 条</option>
                 </select>
               </label>
+              <label>
+                <span>每频道补日期</span>
+                <select id="detailLookupLimitInput">
+                  <option value="0">不补</option>
+                  <option value="50">50 条</option>
+                  <option value="120" selected>120 条</option>
+                  <option value="300">300 条</option>
+                  <option value="1000">1000 条</option>
+                </select>
+              </label>
             </div>
 
             <div class="actions">
               <button class="primary" id="discoverButton" type="button">查找勾选频道</button>
-              <button class="secondary" id="refreshDiscovery" type="button" disabled>更新当前记录</button>
+            </div>
+
+            <div class="discovery-progress progress-block" id="discoveryProgress" hidden>
+              <div class="progress-copy">
+                <span id="discoveryProgressLabel">等待扫描</span>
+                <span id="discoveryProgressCount">0 / 0</span>
+              </div>
+              <div class="progress-track" aria-hidden="true">
+                <div class="progress-fill" id="discoveryProgressBar"></div>
+              </div>
+              <div class="discovery-progress-message" id="discoveryProgressMessage">准备扫描频道</div>
+              <div class="discovery-source-progress" id="discoverySourceProgress"></div>
             </div>
 
             <div class="history-block compact-history">
               <div class="history-head">
-                <h2>查找记录</h2>
+                <h2>扫描历史</h2>
                 <button class="secondary small" id="refreshDiscoveryHistory" type="button">刷新</button>
               </div>
               <div class="history-list discovery-history-list" id="discoveryHistoryList">
-                <div class="history-empty">暂无查找记录</div>
+                <div class="history-empty">暂无扫描历史</div>
               </div>
             </div>
           </aside>
@@ -96,7 +117,7 @@
             <div class="section-head">
               <div>
                 <h2>内容查看</h2>
-                <p id="activeDiscoveryLabel">尚未选择查找记录或频道</p>
+                <p id="activeDiscoveryLabel">尚未选择扫描历史或频道</p>
               </div>
               <div class="section-actions" id="discoveryActions">
                 <button class="secondary small" id="selectAllDiscovery" type="button">全选</button>
@@ -207,6 +228,6 @@ https://www.youtube.com/watch?v=f6SIJDGGjuY</textarea>
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260702-no-content-tabs"></script>
+    <script src="/static/app.js?v=20260703-source-progress"></script>
   </body>
 </html>

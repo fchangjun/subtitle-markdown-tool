@@ -17,7 +17,6 @@ const refreshHistoryButton = document.querySelector("#refreshHistoryButton");
 const rangeInput = document.querySelector("#rangeInput");
 const maxPerSourceInput = document.querySelector("#maxPerSourceInput");
 const discoverButton = document.querySelector("#discoverButton");
-const refreshDiscovery = document.querySelector("#refreshDiscovery");
 const refreshDiscoveryHistory = document.querySelector("#refreshDiscoveryHistory");
 const discoverySummary = document.querySelector("#discoverySummary");
 const activeDiscoveryLabel = document.querySelector("#activeDiscoveryLabel");
@@ -26,9 +25,16 @@ const discoveryHistoryList = document.querySelector("#discoveryHistoryList");
 const discoveryList = document.querySelector("#discoveryList");
 const discoveryActions = document.querySelector("#discoveryActions");
 const discoveryStatus = document.querySelector("#discoveryStatus");
+const discoveryProgress = document.querySelector("#discoveryProgress");
+const discoveryProgressLabel = document.querySelector("#discoveryProgressLabel");
+const discoveryProgressCount = document.querySelector("#discoveryProgressCount");
+const discoveryProgressBar = document.querySelector("#discoveryProgressBar");
+const discoveryProgressMessage = document.querySelector("#discoveryProgressMessage");
+const discoverySourceProgress = document.querySelector("#discoverySourceProgress");
 const selectAllDiscovery = document.querySelector("#selectAllDiscovery");
 const clearDiscoverySelection = document.querySelector("#clearDiscoverySelection");
 const importDiscovery = document.querySelector("#importDiscovery");
+const detailLookupLimitInput = document.querySelector("#detailLookupLimitInput");
 const followInput = document.querySelector("#followInput");
 const addChannelsButton = document.querySelector("#addChannelsButton");
 const refreshChannels = document.querySelector("#refreshChannels");
@@ -44,6 +50,7 @@ const pages = {
 
 let activeJobId = null;
 let pollTimer = null;
+let discoveryTaskPollTimer = null;
 let selectedFileUrl = null;
 let activeDiscoveryRecord = null;
 let discoveredVideos = [];
@@ -62,6 +69,7 @@ const statusText = {
   running: "处理中",
   completed: "已完成",
   completed_with_errors: "部分完成",
+  failed: "失败",
 };
 
 function switchPage(pageName) {
@@ -82,9 +90,9 @@ function switchContentView(viewName) {
   if (!showingResults && !activeChannel) {
     activeDiscoveryLabel.textContent = "选择一个关注频道查看内容";
   } else if (showingResults && activeDiscoveryRecord) {
-    activeDiscoveryLabel.textContent = `记录 ${activeDiscoveryRecord.id} · 更新于 ${formatDateTime(activeDiscoveryRecord.updated_at)}`;
+    activeDiscoveryLabel.textContent = `扫描 ${activeDiscoveryRecord.id} · 更新于 ${formatDateTime(activeDiscoveryRecord.updated_at)}`;
   } else if (showingResults) {
-    activeDiscoveryLabel.textContent = "尚未选择查找记录";
+    activeDiscoveryLabel.textContent = "尚未选择扫描历史";
   }
 }
 
@@ -256,7 +264,7 @@ function renderChannelList(channels) {
     const detail = [
       `${channel.video_count || 0} 个内容`,
       `${channel.scanned_count || 0} 个已扫`,
-      `${channel.unknown_date_count || 0} 个日期未知`,
+      `${channel.unknown_date_count || 0} 个日期未知已跳过`,
       formatDateTime(channel.last_discovered_at || channel.updated_at),
     ];
 
@@ -311,7 +319,7 @@ function renderChannelDetail(channel) {
   intro.textContent = channelIntro(channel);
   const meta = document.createElement("div");
   meta.className = "history-meta";
-  meta.textContent = `${channel.video_count || 0} 个内容 · ${channel.known_date_count || 0} 个日期明确 · ${channel.unknown_date_count || 0} 个日期未知 · 更新 ${formatDateTime(channel.last_discovered_at || channel.updated_at)}`;
+  meta.textContent = `${channel.video_count || 0} 个内容 · ${channel.known_date_count || 0} 个日期明确 · ${channel.unknown_date_count || 0} 个日期未知已跳过 · 更新 ${formatDateTime(channel.last_discovered_at || channel.updated_at)}`;
   const copy = document.createElement("div");
   copy.append(title, intro, meta);
   head.appendChild(copy);
@@ -364,10 +372,20 @@ function renderChannelDetail(channel) {
     row.href = video.url;
     row.target = "_blank";
     row.rel = "noreferrer";
-    row.innerHTML = `
-      <span class="channel-video-title">${video.title || video.url}</span>
-      <span class="history-meta">${video.publish_date || "日期未知"} · 视频 ${formatOptionalSeconds(video.duration_seconds)} · ${formatViews(video.view_count)}</span>
-    `;
+
+    const copy = document.createElement("span");
+    copy.className = "channel-video-copy";
+
+    const title = document.createElement("span");
+    title.className = "channel-video-title";
+    title.textContent = video.title || video.url;
+
+    const meta = document.createElement("span");
+    meta.className = "history-meta";
+    meta.textContent = `${video.publish_date || "日期未知"} · 视频 ${formatOptionalSeconds(video.duration_seconds)} · ${formatViews(video.view_count)}`;
+
+    copy.append(title, meta);
+    row.append(createVideoThumbnail(video, "channel-thumbnail"), copy);
     list.appendChild(row);
   });
   channelDetail.appendChild(list);
@@ -424,35 +442,26 @@ async function addFollowedChannels() {
 
 async function refreshActiveChannel() {
   if (!activeChannel) return;
-  refreshChannelButton.disabled = true;
-  channelDetail.innerHTML = '<div class="history-empty">正在更新频道内容</div>';
+  setDiscoveryBusy(true);
+  channelDetail.innerHTML = '<div class="history-empty">频道更新任务已提交，正在准备</div>';
   try {
-    const response = await fetch(`/api/channels/${encodeURIComponent(activeChannel.id)}/refresh`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        range: rangeInput.value.trim() || "1年",
-        max_per_source: Number(maxPerSourceInput.value || 120),
-      }),
+    await createDiscoveryTask({
+      channel_id: activeChannel.id,
+      range: rangeInput.value.trim() || "1年",
+      max_per_source: Number(maxPerSourceInput.value || 120),
+      detail_lookup_limit: Number(detailLookupLimitInput.value || 120),
     });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-    renderChannelList(payload.channels || []);
-    renderChannelDetail(payload.channel);
-    renderDiscoveryRecord(payload.record, { activateResults: false });
-    await loadDiscoveryHistory();
   } catch (error) {
     channelDetail.innerHTML = `<div class="history-empty">${error.message}</div>`;
-  } finally {
-    refreshChannelButton.disabled = !activeChannel;
+    setDiscoveryBusy(false);
   }
 }
 
 function setDiscoveryBusy(isBusy, label = "查找视频") {
   discoverButton.disabled = isBusy;
-  refreshDiscovery.disabled = isBusy || !activeDiscoveryRecord;
+  refreshChannelButton.disabled = isBusy || !activeChannel;
   if (isBusy) {
-    discoverButton.textContent = "查找中";
+    discoverButton.textContent = "扫描中";
   } else if (label) {
     updateChannelSelectionSummary();
   }
@@ -496,15 +505,32 @@ function updateDiscoverySelectionSummary() {
   const selectedCount = selectedDiscoveryVideos().length;
   const totalCount = discoveredVideos.length;
   const visibleCount = filteredDiscoveryVideos().length;
-  if (!totalCount) {
-    discoverySummary.textContent = "尚未发现视频";
-    return;
-  }
   const summary = activeDiscoveryRecord?.summary || {};
   const notes = [];
-  if (summary.unknown_date_count) notes.push(`${summary.unknown_date_count} 个日期未知`);
+  const providerText = providerSummaryText(summary.provider_counts || {});
+  if (providerText) notes.push(providerText);
+  if (summary.fallback_count) notes.push(`${summary.fallback_count} 个频道 API 降级`);
+  if (summary.yt_dlp_capped_count) {
+    const cap = summary.yt_dlp_cap || 1000;
+    notes.push(`${summary.yt_dlp_capped_count} 个频道 yt-dlp 已按环境上限 ${cap} 条执行`);
+  }
+  if (summary.api_request_count) notes.push(`API ${summary.api_request_count} 次`);
+  if (summary.yt_dlp_batch_count) {
+    notes.push(`yt-dlp ${summary.yt_dlp_batch_count} 批，每批 ${summary.yt_dlp_batch_size || 100} 条`);
+  }
+  if (summary.stopped_by_cutoff_count) notes.push(`${summary.stopped_by_cutoff_count} 个频道遇到旧日期已提前停止`);
+  if (summary.detail_lookup_count) {
+    notes.push(`补日期 ${summary.detail_lookup_success_count || 0}/${summary.detail_lookup_count}`);
+  }
+  if (summary.unknown_date_count) notes.push(`${summary.unknown_date_count} 个日期未知已跳过`);
+  if (summary.detail_lookup_limit_reached_count) notes.push(`${summary.detail_lookup_limit_reached_count} 个频道达到补日期上限`);
+  if (summary.detail_lookup_error_count) notes.push(`${summary.detail_lookup_error_count} 个补日期失败`);
   if (summary.limit_reached_count) notes.push(`${summary.limit_reached_count} 个频道达到上限`);
   if (summary.error_count) notes.push(`${summary.error_count} 个频道失败`);
+  if (!totalCount) {
+    discoverySummary.textContent = notes.length ? `候选 0 个 · ${notes.join(" · ")}` : "尚未发现视频";
+    return;
+  }
   const filterText = visibleCount === totalCount ? "" : `，当前显示 ${visibleCount} 个`;
   discoverySummary.textContent = `候选 ${totalCount} 个，已选 ${selectedCount} 个${filterText}${notes.length ? ` · ${notes.join(" · ")}` : ""}`;
 }
@@ -514,6 +540,188 @@ function addDiscoveryPill(meta, text, className = "") {
   item.className = `pill ${className}`.trim();
   item.textContent = text;
   meta.appendChild(item);
+}
+
+function providerSummaryText(providerCounts = {}) {
+  const labels = {
+    youtube_api: "YouTube API",
+    yt_dlp: "yt-dlp",
+    unknown: "未知来源",
+  };
+  return Object.entries(providerCounts)
+    .filter(([, count]) => Number(count) > 0)
+    .map(([provider, count]) => `${labels[provider] || provider} ${count}`)
+    .join(" · ");
+}
+
+function normalizedSourceKey(value) {
+  return String(value || "").trim().replace(/\/+$/, "").toLowerCase();
+}
+
+function followedChannelForSource(sourceUrl) {
+  const sourceKey = normalizedSourceKey(sourceUrl);
+  if (!sourceKey) return null;
+  return followedChannels.find((channel) =>
+    [channel.source_url, channel.listing_url]
+      .map(normalizedSourceKey)
+      .includes(sourceKey)
+  ) || null;
+}
+
+function discoverySourceGroups(videos) {
+  const groups = [];
+  const byKey = new Map();
+  videos.forEach((video) => {
+    const sourceUrl = video.source_url || "";
+    const key = normalizedSourceKey(sourceUrl) || `unknown:${video.source_title || video.channel || ""}`;
+    let group = byKey.get(key);
+    if (!group) {
+      const channel = followedChannelForSource(sourceUrl);
+      group = {
+        key,
+        sourceUrl,
+        title: video.source_title || (channel ? channelTitle(channel) : "") || sourceUrl || "未知频道",
+        channel,
+        items: [],
+      };
+      byKey.set(key, group);
+      groups.push(group);
+    }
+    group.items.push(video);
+  });
+  return groups;
+}
+
+function youtubeIdFromUrl(value) {
+  try {
+    const parsed = new URL(value);
+    const host = parsed.hostname.toLowerCase();
+    if (host.endsWith("youtu.be")) {
+      return parsed.pathname.split("/").filter(Boolean)[0] || "";
+    }
+    if (host.includes("youtube.com")) {
+      const watchId = parsed.searchParams.get("v");
+      if (watchId) return watchId;
+      const parts = parsed.pathname.split("/").filter(Boolean);
+      const markerIndex = parts.findIndex((part) => ["shorts", "embed", "live"].includes(part));
+      if (markerIndex >= 0) return parts[markerIndex + 1] || "";
+    }
+  } catch {
+    return "";
+  }
+  return "";
+}
+
+function thumbnailUrlForVideo(video) {
+  const explicitUrl = String(video.thumbnail_url || video.thumbnail || "").trim();
+  if (explicitUrl) return explicitUrl;
+  const videoId = youtubeIdFromUrl(video.url);
+  return videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : "";
+}
+
+function createVideoThumbnail(video, className = "", asLink = false) {
+  const thumbnail = document.createElement(asLink ? "a" : "span");
+  thumbnail.className = `video-thumbnail ${className}`.trim();
+  if (asLink) {
+    thumbnail.href = video.url;
+    thumbnail.target = "_blank";
+    thumbnail.rel = "noreferrer";
+  }
+
+  const thumbnailUrl = thumbnailUrlForVideo(video);
+  if (!thumbnailUrl) {
+    thumbnail.classList.add("missing");
+    return thumbnail;
+  }
+
+  const image = document.createElement("img");
+  image.src = thumbnailUrl;
+  image.alt = "";
+  image.loading = "lazy";
+  image.referrerPolicy = "no-referrer";
+  image.addEventListener("error", () => {
+    image.remove();
+    thumbnail.classList.add("missing");
+  });
+  thumbnail.appendChild(image);
+  return thumbnail;
+}
+
+function createDiscoveryItem(video) {
+  const item = document.createElement("article");
+  item.className = "discovery-item";
+
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = selectedDiscoveryUrls.has(video.url);
+  checkbox.addEventListener("change", () => {
+    if (checkbox.checked) selectedDiscoveryUrls.add(video.url);
+    else selectedDiscoveryUrls.delete(video.url);
+    saveDiscoverySelection();
+  });
+
+  const info = document.createElement("div");
+  info.className = "discovery-info";
+  const title = document.createElement("a");
+  title.className = "discovery-title";
+  title.href = video.url;
+  title.target = "_blank";
+  title.rel = "noreferrer";
+  title.textContent = video.title || video.url;
+
+  const meta = document.createElement("div");
+  meta.className = "result-meta";
+  addDiscoveryPill(meta, video.publish_date || "日期未知", video.date_known ? "manual" : "automatic");
+  addDiscoveryPill(meta, `视频 ${formatOptionalSeconds(video.duration_seconds)}`);
+  addDiscoveryPill(meta, formatViews(video.view_count));
+  if (video.channel) addDiscoveryPill(meta, video.channel);
+
+  info.append(title, meta);
+  if (video.description) {
+    const description = document.createElement("div");
+    description.className = "discovery-description";
+    description.textContent = video.description;
+    info.appendChild(description);
+  }
+
+  item.append(checkbox, createVideoThumbnail(video, "discovery-thumbnail", true), info);
+  return item;
+}
+
+function createDiscoveryGroup(group, showHeader) {
+  const section = document.createElement("section");
+  section.className = "discovery-group";
+  if (showHeader) {
+    const header = document.createElement("div");
+    header.className = "discovery-group-head";
+
+    const copy = document.createElement("div");
+    const title = document.createElement("div");
+    title.className = "discovery-group-title";
+    title.textContent = group.title;
+    const meta = document.createElement("div");
+    meta.className = "history-meta";
+    const selectedCount = group.items.filter((video) => selectedDiscoveryUrls.has(video.url)).length;
+    meta.textContent = `${group.items.length} 个候选 · 已选 ${selectedCount} 个`;
+    copy.append(title, meta);
+    header.appendChild(copy);
+
+    if (group.channel) {
+      const openButton = document.createElement("button");
+      openButton.className = "file-link";
+      openButton.type = "button";
+      openButton.textContent = "查看频道";
+      openButton.addEventListener("click", () => loadChannel(group.channel.id));
+      header.appendChild(openButton);
+    }
+
+    section.appendChild(header);
+  }
+
+  group.items.forEach((video) => {
+    section.appendChild(createDiscoveryItem(video));
+  });
+  return section;
 }
 
 function renderDiscoveryCandidates() {
@@ -528,50 +736,10 @@ function renderDiscoveryCandidates() {
     return;
   }
 
-  videos.forEach((video) => {
-    const item = document.createElement("article");
-    item.className = "discovery-item";
-
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.checked = selectedDiscoveryUrls.has(video.url);
-    checkbox.addEventListener("change", () => {
-      if (checkbox.checked) selectedDiscoveryUrls.add(video.url);
-      else selectedDiscoveryUrls.delete(video.url);
-      saveDiscoverySelection();
-    });
-
-    const info = document.createElement("div");
-    const title = document.createElement("a");
-    title.className = "discovery-title";
-    title.href = video.url;
-    title.target = "_blank";
-    title.rel = "noreferrer";
-    title.textContent = video.title || video.url;
-
-    const meta = document.createElement("div");
-    meta.className = "result-meta";
-    addDiscoveryPill(meta, video.publish_date || "日期未知", video.date_known ? "manual" : "automatic");
-    addDiscoveryPill(meta, `视频 ${formatOptionalSeconds(video.duration_seconds)}`);
-    addDiscoveryPill(meta, formatViews(video.view_count));
-    if (video.channel) addDiscoveryPill(meta, video.channel);
-
-    info.append(title, meta);
-    if (video.description) {
-      const description = document.createElement("div");
-      description.className = "discovery-description";
-      description.textContent = video.description;
-      info.appendChild(description);
-    }
-    if (video.source_title || video.source_url) {
-      const source = document.createElement("div");
-      source.className = "discovery-source";
-      source.textContent = video.source_title || video.source_url;
-      info.appendChild(source);
-    }
-
-    item.append(checkbox, info);
-    discoveryList.appendChild(item);
+  const groups = discoverySourceGroups(videos);
+  const showHeaders = groups.length > 1 || (activeDiscoveryRecord?.sources || []).length > 1;
+  groups.forEach((group) => {
+    discoveryList.appendChild(createDiscoveryGroup(group, showHeaders));
   });
   updateDiscoverySelectionSummary();
 }
@@ -583,12 +751,143 @@ function renderDiscoveryRecord(record, options = {}) {
   selectedDiscoveryUrls = loadDiscoverySelection(record);
   localStorage.setItem(ACTIVE_DISCOVERY_KEY, record.id);
   if (activateResults) {
-    activeDiscoveryLabel.textContent = `记录 ${record.id} · 更新于 ${formatDateTime(record.updated_at)}`;
+    activeDiscoveryLabel.textContent = `扫描 ${record.id} · 更新于 ${formatDateTime(record.updated_at)}`;
   }
-  refreshDiscovery.disabled = false;
   discoveryFilterInput.value = "";
   renderDiscoveryCandidates();
   if (activateResults) switchContentView("results");
+}
+
+function stopDiscoveryTaskPolling() {
+  if (discoveryTaskPollTimer) {
+    clearInterval(discoveryTaskPollTimer);
+    discoveryTaskPollTimer = null;
+  }
+}
+
+function discoverySourceTitle(source) {
+  const channel = followedChannelForSource(source.source_url);
+  return channel ? channelTitle(channel) : source.source_url || `频道 ${source.index || ""}`;
+}
+
+function renderDiscoverySourceProgress(sources = []) {
+  discoverySourceProgress.innerHTML = "";
+  if (!sources.length) return;
+
+  sources.forEach((source) => {
+    const total = source.total || 0;
+    const current = Math.min(source.current || 0, total || source.current || 0);
+    const pct = total ? Math.min(100, Math.round((current / total) * 100)) : 0;
+    const item = document.createElement("div");
+    item.className = `discovery-source-progress-item ${source.status || "queued"}`;
+
+    const top = document.createElement("div");
+    top.className = "discovery-source-progress-top";
+
+    const title = document.createElement("div");
+    title.className = "discovery-source-progress-title";
+    title.textContent = discoverySourceTitle(source);
+
+    const status = document.createElement("div");
+    status.className = "history-meta";
+    const statusLabel = statusText[source.status] || "等待";
+    status.textContent = total ? `${statusLabel} · ${current}/${total}` : statusLabel;
+    top.append(title, status);
+
+    const track = document.createElement("div");
+    track.className = "source-progress-track";
+    const fill = document.createElement("div");
+    fill.style.width = `${pct}%`;
+    track.appendChild(fill);
+
+    const message = document.createElement("div");
+    message.className = "discovery-source-progress-message";
+    const scanned = Number(source.scanned_count || 0);
+    const included = Number(source.included_count || 0);
+    const countText = scanned || included ? ` · 已扫 ${scanned} · 候选 ${included}` : "";
+    message.textContent = `${source.message || "等待扫描"}${countText}`;
+
+    item.append(top, track, message);
+    discoverySourceProgress.appendChild(item);
+  });
+}
+
+function renderDiscoveryTaskProgress(task) {
+  const total = task.total || 0;
+  const current = Math.min(task.current || 0, total || task.current || 0);
+  const pct = total ? Math.min(100, Math.round((current / total) * 100)) : 0;
+  discoveryProgress.hidden = false;
+  discoveryProgressLabel.textContent = statusText[task.status] || "扫描中";
+  discoveryProgressCount.textContent = total ? `${current} / ${total}` : `${current}`;
+  discoveryProgressBar.style.width = `${pct}%`;
+  discoveryProgressMessage.textContent = task.message || "正在扫描频道";
+  discoverySummary.textContent = task.message || "扫描中";
+  renderDiscoverySourceProgress(task.source_progress || []);
+}
+
+async function finishDiscoveryTask(task) {
+  stopDiscoveryTaskPolling();
+  renderDiscoveryTaskProgress(task);
+  if (task.status === "failed") {
+    discoverySummary.textContent = `扫描失败：${task.error || task.message || "未知错误"}`;
+    setDiscoveryBusy(false);
+    return;
+  }
+
+  const result = task.result;
+  if (!result) {
+    discoverySummary.textContent = "扫描完成，但没有返回结果";
+    setDiscoveryBusy(false);
+    return;
+  }
+
+  if (task.kind === "channel_refresh") {
+    renderChannelList(result.channels || []);
+    renderChannelDetail(result.channel);
+    renderDiscoveryRecord(result.record, { activateResults: false });
+  } else {
+    renderDiscoveryRecord(result);
+  }
+  await Promise.all([loadDiscoveryHistory(), loadChannels()]);
+  discoveryProgressMessage.textContent = "扫描完成，内容已按频道保存";
+  setDiscoveryBusy(false);
+}
+
+async function pollDiscoveryTask(taskId) {
+  try {
+    const response = await fetch(`/api/discovery-tasks/${encodeURIComponent(taskId)}`);
+    const task = await response.json();
+    if (!response.ok) throw new Error(task.error || `HTTP ${response.status}`);
+    renderDiscoveryTaskProgress(task);
+    if (task.status === "completed" || task.status === "completed_with_errors" || task.status === "failed") {
+      await finishDiscoveryTask(task);
+    }
+    return task;
+  } catch (error) {
+    stopDiscoveryTaskPolling();
+    discoverySummary.textContent = `扫描状态读取失败：${error.message}`;
+    discoveryProgressMessage.textContent = error.message;
+    setDiscoveryBusy(false);
+  }
+}
+
+function startDiscoveryTaskPolling(taskId) {
+  stopDiscoveryTaskPolling();
+  pollDiscoveryTask(taskId);
+  discoveryTaskPollTimer = setInterval(() => pollDiscoveryTask(taskId), 1200);
+}
+
+async function createDiscoveryTask(payload) {
+  const response = await fetch("/api/discovery-tasks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const task = await response.json();
+  if (!response.ok) throw new Error(task.error || `HTTP ${response.status}`);
+  renderDiscoveryTaskProgress(task);
+  startDiscoveryTaskPolling(task.id);
+  return task;
 }
 
 async function discoverChannelVideos() {
@@ -601,23 +900,16 @@ async function discoverChannelVideos() {
 
   setDiscoveryBusy(true);
   switchContentView("results");
-  discoveryList.innerHTML = '<div class="empty-state">正在查找频道视频</div>';
-  discoverySummary.textContent = "查找中";
+  discoveryList.innerHTML = '<div class="empty-state">扫描任务已提交，正在准备</div>';
+  discoverySummary.textContent = "扫描任务已提交";
 
   try {
-    const response = await fetch("/api/discover", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sources,
-        range: rangeInput.value.trim() || "1年",
-        max_per_source: Number(maxPerSourceInput.value || 120),
-      }),
+    await createDiscoveryTask({
+      sources,
+      range: rangeInput.value.trim() || "1年",
+      max_per_source: Number(maxPerSourceInput.value || 120),
+      detail_lookup_limit: Number(detailLookupLimitInput.value || 120),
     });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-    renderDiscoveryRecord(payload);
-    await Promise.all([loadDiscoveryHistory(), loadChannels()]);
   } catch (error) {
     discoverySummary.textContent = "查找失败";
     discoveryList.innerHTML = "";
@@ -625,26 +917,6 @@ async function discoverChannelVideos() {
     item.className = "empty-state";
     item.textContent = error.message;
     discoveryList.appendChild(item);
-  } finally {
-    setDiscoveryBusy(false);
-  }
-}
-
-async function refreshActiveDiscovery() {
-  if (!activeDiscoveryRecord) return;
-  setDiscoveryBusy(true, "查找视频");
-  discoverySummary.textContent = "更新中";
-  try {
-    const response = await fetch(`/api/discoveries/${encodeURIComponent(activeDiscoveryRecord.id)}/refresh`, {
-      method: "POST",
-    });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-    renderDiscoveryRecord(payload);
-    await Promise.all([loadDiscoveryHistory(), loadChannels()]);
-  } catch (error) {
-    discoverySummary.textContent = `更新失败：${error.message}`;
-  } finally {
     setDiscoveryBusy(false);
   }
 }
@@ -687,7 +959,7 @@ async function loadDiscoveryRecord(recordId) {
 
 function renderDiscoveryHistory(records) {
   if (!records.length) {
-    discoveryHistoryList.innerHTML = '<div class="history-empty">暂无查找记录</div>';
+    discoveryHistoryList.innerHTML = '<div class="history-empty">暂无扫描历史</div>';
     return;
   }
   discoveryHistoryList.innerHTML = "";
@@ -695,9 +967,14 @@ function renderDiscoveryHistory(records) {
     const item = document.createElement("button");
     item.className = "history-item";
     item.type = "button";
+    const providerText = providerSummaryText(record.provider_counts || {});
+    const detailText = record.detail_lookup_count
+      ? ` · 补日期 ${record.detail_lookup_success_count || 0}/${record.detail_lookup_count}`
+      : "";
+    const providerMeta = providerText ? ` · ${providerText}` : "";
     item.innerHTML = `
       <span class="history-title">${record.source_titles?.[0] || record.sources?.[0] || record.id}</span>
-      <span class="history-meta">${record.video_count || 0} 个候选 · ${record.scanned_count || 0} 个已扫 · ${formatDateTime(record.updated_at)}</span>
+      <span class="history-meta">${record.video_count || 0} 个候选 · ${record.scanned_count || 0} 个已扫${providerMeta}${detailText} · ${formatDateTime(record.updated_at)}</span>
     `;
     item.addEventListener("click", () => loadDiscoveryRecord(record.id));
     discoveryHistoryList.appendChild(item);
@@ -941,7 +1218,6 @@ async function init() {
   runButton.addEventListener("click", createJob);
   refreshHistoryButton.addEventListener("click", loadHistory);
   discoverButton.addEventListener("click", discoverChannelVideos);
-  refreshDiscovery.addEventListener("click", refreshActiveDiscovery);
   refreshDiscoveryHistory.addEventListener("click", loadDiscoveryHistory);
   refreshChannels.addEventListener("click", loadChannels);
   addChannelsButton.addEventListener("click", addFollowedChannels);

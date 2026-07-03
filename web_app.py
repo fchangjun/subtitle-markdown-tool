@@ -4,6 +4,8 @@ import mimetypes
 import os
 import random
 import re
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -14,14 +16,15 @@ import csv
 import hashlib
 import shutil
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from urllib.parse import unquote, urlparse
 
-import yt_dlp
+import requests
 
 from youtube_subtitles_to_md import (
     clean_scalar,
@@ -47,6 +50,27 @@ CHANNEL_INDEX_PATH = CHANNELS_DIR / "index.json"
 MAX_BODY_BYTES = 128 * 1024
 
 
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_env_file(ROOT / ".env")
+
+
 def env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, default))
@@ -57,6 +81,15 @@ def env_int(name: str, default: int) -> int:
 def env_float(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def int_or_default(value: object, default: int) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return default
 
@@ -74,6 +107,25 @@ DISCOVERY_DEFAULT_MAX_PER_SOURCE = max(1, env_int("SUBTITLE_DISCOVERY_MAX_PER_SO
 DISCOVERY_HARD_MAX_PER_SOURCE = max(
     DISCOVERY_DEFAULT_MAX_PER_SOURCE,
     env_int("SUBTITLE_DISCOVERY_HARD_MAX_PER_SOURCE", 1000),
+)
+DISCOVERY_DEFAULT_DETAIL_LOOKUP_LIMIT = max(0, env_int("SUBTITLE_DISCOVERY_DETAIL_LOOKUP_LIMIT", 120))
+DISCOVERY_DETAIL_LOOKUP_HARD_LIMIT = max(
+    DISCOVERY_DEFAULT_DETAIL_LOOKUP_LIMIT,
+    env_int("SUBTITLE_DISCOVERY_DETAIL_LOOKUP_HARD_LIMIT", 1000),
+)
+DISCOVERY_DETAIL_LOOKUP_WORKERS = max(1, env_int("SUBTITLE_DISCOVERY_DETAIL_LOOKUP_WORKERS", 4))
+DISCOVERY_DETAIL_TIMEOUT_SECONDS = max(3.0, env_float("SUBTITLE_DISCOVERY_DETAIL_TIMEOUT_SECONDS", 18.0))
+DISCOVERY_DETAIL_SOCKET_TIMEOUT_SECONDS = max(3, env_int("SUBTITLE_DISCOVERY_DETAIL_SOCKET_TIMEOUT_SECONDS", 8))
+DISCOVERY_YTDLP_LIST_TIMEOUT_SECONDS = max(5.0, env_float("SUBTITLE_DISCOVERY_YTDLP_LIST_TIMEOUT_SECONDS", 600.0))
+DISCOVERY_YTDLP_BATCH_SIZE = max(1, min(500, env_int("SUBTITLE_DISCOVERY_YTDLP_BATCH_SIZE", 100)))
+YOUTUBE_DATA_API_KEY = clean_scalar(os.environ.get("YOUTUBE_DATA_API_KEY") or os.environ.get("YOUTUBE_API_KEY"))
+YOUTUBE_API_TIMEOUT_SECONDS = max(3.0, env_float("YOUTUBE_API_TIMEOUT_SECONDS", 20.0))
+DISCOVERY_YTDLP_MAX_PER_SOURCE_WITHOUT_API = max(
+    1,
+    min(
+        DISCOVERY_HARD_MAX_PER_SOURCE,
+        env_int("SUBTITLE_DISCOVERY_YTDLP_MAX_PER_SOURCE_WITHOUT_API", DISCOVERY_HARD_MAX_PER_SOURCE),
+    ),
 )
 
 
@@ -111,8 +163,33 @@ class Job:
     errors: List[Dict[str, object]] = field(default_factory=list)
 
 
+@dataclass
+class DiscoveryTask:
+    id: str
+    sources: List[str]
+    range_text: str
+    max_per_source: int
+    detail_lookup_limit: int
+    kind: str = "discover"
+    channel_id: str = ""
+    status: str = "queued"
+    current: int = 0
+    total: int = 1
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    message: str = ""
+    record_id: str = ""
+    result: Optional[Dict[str, object]] = None
+    error: str = ""
+    source_progress: List[Dict[str, object]] = field(default_factory=list)
+
+
 jobs: Dict[str, Job] = {}
+discovery_tasks: Dict[str, DiscoveryTask] = {}
 jobs_lock = threading.Lock()
+discovery_tasks_lock = threading.Lock()
 cache_lock = threading.Lock()
 channels_lock = threading.Lock()
 url_cache: Dict[str, Dict[str, object]] = {}
@@ -163,6 +240,9 @@ def parse_discovery_sources(raw: str) -> List[str]:
     if len(sources) > DISCOVERY_MAX_SOURCES:
         raise ValueError(f"Too many channel URLs. Limit is {DISCOVERY_MAX_SOURCES} per discovery.")
     return sources
+
+
+DiscoveryProgressCallback = Optional[Callable[[Dict[str, object]], None]]
 
 
 def subtract_months(value: date, months: int) -> date:
@@ -222,12 +302,15 @@ def discovery_listing_url(value: str) -> str:
 
 
 def date_from_video_entry(entry: Dict[str, object]) -> Optional[date]:
-    upload_date = clean_scalar(entry.get("upload_date"))
-    if upload_date:
-        try:
-            return datetime.strptime(upload_date, "%Y%m%d").date()
-        except ValueError:
-            pass
+    for key in ["upload_date", "release_date", "modified_date"]:
+        raw_date = clean_scalar(entry.get(key))
+        if not raw_date:
+            continue
+        for candidate, fmt in [(raw_date[:8], "%Y%m%d"), (raw_date[:10], "%Y-%m-%d")]:
+            try:
+                return datetime.strptime(candidate, fmt).date()
+            except ValueError:
+                pass
 
     for key in ["timestamp", "release_timestamp", "modified_timestamp"]:
         timestamp = entry.get(key)
@@ -240,6 +323,16 @@ def date_from_video_entry(entry: Dict[str, object]) -> Optional[date]:
     return None
 
 
+def date_from_iso_text(value: object) -> Optional[date]:
+    text = clean_scalar(value)
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
 def video_url_from_entry(entry: Dict[str, object]) -> str:
     video_id = clean_scalar(entry.get("id"))
     value = clean_scalar(entry.get("webpage_url") or entry.get("url"))
@@ -248,6 +341,33 @@ def video_url_from_entry(entry: Dict[str, object]) -> str:
     if video_id:
         return f"https://www.youtube.com/watch?v={video_id}"
     return value
+
+
+def thumbnail_url_from_entry(entry: Dict[str, object], video_url: str = "") -> str:
+    for key in ["thumbnail", "thumbnail_url"]:
+        value = clean_scalar(entry.get(key))
+        if value.startswith("http://") or value.startswith("https://"):
+            return value
+
+    thumbnails = entry.get("thumbnails")
+    if isinstance(thumbnails, list):
+        candidates = []
+        for thumbnail in thumbnails:
+            if not isinstance(thumbnail, dict):
+                continue
+            url = clean_scalar(thumbnail.get("url"))
+            if not (url.startswith("http://") or url.startswith("https://")):
+                continue
+            width = number_or_none(thumbnail.get("width")) or 0
+            height = number_or_none(thumbnail.get("height")) or 0
+            candidates.append((width * height, url))
+        if candidates:
+            return max(candidates, key=lambda item: item[0])[1]
+
+    video_id = clean_scalar(entry.get("id") or youtube_id_from_url(video_url))
+    if video_id:
+        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    return ""
 
 
 def number_or_none(value: object) -> Optional[int]:
@@ -259,22 +379,407 @@ def number_or_none(value: object) -> Optional[int]:
         return None
 
 
-def discover_source_videos(source_url: str, cutoff_date: date, max_per_source: int) -> Dict[str, object]:
+def is_youtube_url(value: str) -> bool:
+    host = urlparse(value).netloc.lower()
+    return "youtube.com" in host or host.endswith("youtu.be")
+
+
+def parse_api_datetime(value: object) -> Optional[date]:
+    text = clean_scalar(value)
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except ValueError:
+        return date_from_iso_text(text)
+
+
+def thumbnail_url_from_api(thumbnails: object) -> str:
+    if not isinstance(thumbnails, dict):
+        return ""
+    candidates = []
+    for thumb in thumbnails.values():
+        if not isinstance(thumb, dict):
+            continue
+        url = clean_scalar(thumb.get("url"))
+        if not (url.startswith("http://") or url.startswith("https://")):
+            continue
+        width = number_or_none(thumb.get("width")) or 0
+        height = number_or_none(thumb.get("height")) or 0
+        candidates.append((width * height, url))
+    if candidates:
+        return max(candidates, key=lambda item: item[0])[1]
+    return ""
+
+
+def youtube_api_get(endpoint: str, params: Dict[str, object]) -> Dict[str, object]:
+    if not YOUTUBE_DATA_API_KEY:
+        raise ValueError("YOUTUBE_DATA_API_KEY is not configured.")
+    query = dict(params)
+    query["key"] = YOUTUBE_DATA_API_KEY
+    response = requests.get(
+        f"https://www.googleapis.com/youtube/v3/{endpoint}",
+        params=query,
+        timeout=YOUTUBE_API_TIMEOUT_SECONDS,
+    )
+    if response.status_code >= 400:
+        try:
+            payload = response.json()
+            message = clean_scalar((payload.get("error") or {}).get("message") or response.text)
+        except Exception:
+            message = clean_scalar(response.text)
+        raise ValueError(f"YouTube API {endpoint} failed: HTTP {response.status_code} {message}")
+    return response.json()
+
+
+def youtube_channel_lookup_params(source_url: str) -> Dict[str, object]:
+    parsed = urlparse(source_url)
+    path = parsed.path.rstrip("/")
+    parts = [part for part in path.split("/") if part]
+    if len(parts) >= 2 and parts[0] == "channel":
+        return {"id": parts[1]}
+    if len(parts) >= 2 and parts[0] == "user":
+        return {"forUsername": parts[1]}
+    if parts and parts[0].startswith("@"):
+        return {"forHandle": parts[0]}
+    if parts and parts[0] not in {"videos", "streams", "shorts"}:
+        return {"forHandle": parts[0]}
+    raise ValueError("无法从频道链接识别 YouTube channel id 或 handle。")
+
+
+def youtube_api_channel_for_source(source_url: str) -> Dict[str, object]:
+    params = youtube_channel_lookup_params(source_url)
+    payload = youtube_api_get(
+        "channels",
+        {
+            "part": "snippet,contentDetails",
+            **params,
+        },
+    )
+    items = payload.get("items") or []
+    if not items:
+        raise ValueError("YouTube API 未找到该频道。")
+    return items[0]
+
+
+def youtube_api_discover_source_videos(
+    source_url: str,
+    cutoff_date: date,
+    max_per_source: int,
+    progress_callback: DiscoveryProgressCallback = None,
+    source_index: int = 1,
+    source_count: int = 1,
+) -> Dict[str, object]:
+    channel = youtube_api_channel_for_source(source_url)
+    snippet = channel.get("snippet") or {}
+    uploads_playlist_id = ((channel.get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads")
+    if not uploads_playlist_id:
+        raise ValueError("YouTube API 未返回 uploads playlist。")
+
+    items = []
+    scanned_count = 0
+    unknown_date_count = 0
+    out_of_range_count = 0
+    api_request_count = 1
+    next_page_token = ""
+    stopped_by_cutoff = False
+    page_index = 0
+    while scanned_count < max_per_source:
+        page_size = min(50, max_per_source - scanned_count)
+        page_index += 1
+        if progress_callback:
+            progress_callback(
+                {
+                    "event": "api_page_start",
+                    "source_url": source_url,
+                    "source_index": source_index,
+                    "source_count": source_count,
+                    "page_index": page_index,
+                    "page_size": page_size,
+                    "scanned_count": scanned_count,
+                }
+            )
+        payload = youtube_api_get(
+            "playlistItems",
+            {
+                "part": "snippet,contentDetails,status",
+                "playlistId": uploads_playlist_id,
+                "maxResults": page_size,
+                **({"pageToken": next_page_token} if next_page_token else {}),
+            },
+        )
+        api_request_count += 1
+        page_items = [item for item in (payload.get("items") or []) if isinstance(item, dict)]
+        if not page_items:
+            break
+
+        for playlist_item in page_items:
+            scanned_count += 1
+            item_snippet = playlist_item.get("snippet") or {}
+            item_details = playlist_item.get("contentDetails") or {}
+            resource_id = item_snippet.get("resourceId") or {}
+            video_id = clean_scalar(item_details.get("videoId") or resource_id.get("videoId"))
+            if not video_id:
+                unknown_date_count += 1
+                continue
+
+            publish_date = parse_api_datetime(item_details.get("videoPublishedAt") or item_snippet.get("publishedAt"))
+            if publish_date is None:
+                unknown_date_count += 1
+                continue
+            if publish_date < cutoff_date:
+                out_of_range_count += 1
+                stopped_by_cutoff = True
+                break
+
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            channel_id = clean_scalar(item_snippet.get("videoOwnerChannelId") or item_snippet.get("channelId"))
+            channel_url = f"https://www.youtube.com/channel/{channel_id}" if channel_id else ""
+            items.append(
+                {
+                    "id": video_id,
+                    "url": video_url,
+                    "title": clean_scalar(item_snippet.get("title") or video_url),
+                    "channel": clean_scalar(item_snippet.get("videoOwnerChannelTitle") or item_snippet.get("channelTitle") or snippet.get("title") or ""),
+                    "channel_url": channel_url,
+                    "publish_date": publish_date.isoformat(),
+                    "date_known": True,
+                    "in_range": True,
+                    "duration_seconds": None,
+                    "view_count": None,
+                    "thumbnail_url": thumbnail_url_from_api(item_snippet.get("thumbnails")) or thumbnail_url_from_entry({"id": video_id}, video_url),
+                    "description": clean_scalar(item_snippet.get("description") or ""),
+                    "source_url": source_url,
+                    "date_source": "youtube_api",
+                }
+            )
+
+        next_page_token = clean_scalar(payload.get("nextPageToken"))
+        if progress_callback:
+            progress_callback(
+                {
+                    "event": "api_page_done",
+                    "source_url": source_url,
+                    "source_index": source_index,
+                    "source_count": source_count,
+                    "page_index": page_index,
+                    "scanned_count": scanned_count,
+                    "included_count": len(items),
+                    "stopped_by_cutoff": stopped_by_cutoff,
+                }
+            )
+        if stopped_by_cutoff:
+            break
+        if not next_page_token:
+            break
+
+    return {
+        "source_url": source_url,
+        "listing_url": discovery_listing_url(source_url),
+        "title": clean_scalar(snippet.get("title") or source_url),
+        "description": clean_scalar(snippet.get("description") or ""),
+        "provider": "youtube_api",
+        "api_request_count": api_request_count,
+        "scanned_count": scanned_count,
+        "included_count": len(items),
+        "unknown_date_count": unknown_date_count,
+        "out_of_range_count": out_of_range_count,
+        "detail_lookup_count": 0,
+        "detail_lookup_success_count": 0,
+        "detail_lookup_error_count": 0,
+        "detail_lookup_limit_reached": False,
+        "stopped_by_cutoff": stopped_by_cutoff,
+        "limit_reached": scanned_count >= max_per_source and bool(next_page_token),
+        "items": items,
+    }
+
+
+def detail_lookup_limit_for(max_per_source: int, requested_limit: int) -> int:
+    return max(0, min(max_per_source, requested_limit, DISCOVERY_DETAIL_LOOKUP_HARD_LIMIT))
+
+
+def fetch_video_detail_fields(video_url: str) -> Dict[str, object]:
+    output_template = "\t".join(
+        [
+            "%(upload_date|)s",
+            "%(release_date|)s",
+            "%(modified_date|)s",
+            "%(timestamp|)s",
+            "%(release_timestamp|)s",
+            "%(modified_timestamp|)s",
+            "%(duration|)s",
+            "%(view_count|)s",
+        ]
+    )
+    command = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--quiet",
+        "--no-warnings",
+        "--skip-download",
+        "--no-playlist",
+        "--socket-timeout",
+        str(DISCOVERY_DETAIL_SOCKET_TIMEOUT_SECONDS),
+        "--extractor-retries",
+        "1",
+        "--print",
+        output_template,
+        video_url,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=DISCOVERY_DETAIL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": f"补日期超时（>{DISCOVERY_DETAIL_TIMEOUT_SECONDS:.0f}s）"}
+    except Exception as error:
+        return {"error": str(error)}
+
+    if completed.returncode != 0:
+        message = clean_scalar(completed.stderr or completed.stdout or "补日期失败")
+        return {"error": message}
+
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
+        return {"error": "补日期无返回"}
+
+    values = lines[-1].split("\t")
+    keys = [
+        "upload_date",
+        "release_date",
+        "modified_date",
+        "timestamp",
+        "release_timestamp",
+        "modified_timestamp",
+        "duration",
+        "view_count",
+    ]
+    detail = {}
+    for key, value in zip(keys, values):
+        value = clean_scalar(value)
+        if value and value not in {"NA", "None", "null"}:
+            detail[key] = value
+    return detail
+
+
+def fetch_detail_fields_for(entries: List[Dict[str, object]], limit: int) -> Dict[str, Dict[str, object]]:
+    targets = []
+    seen = set()
+    for entry in entries:
+        if date_from_video_entry(entry) is not None:
+            continue
+        video_url = video_url_from_entry(entry)
+        key = normalize_url(video_url)
+        if not video_url or key in seen:
+            continue
+        seen.add(key)
+        targets.append((key, video_url))
+        if len(targets) >= limit:
+            break
+
+    if not targets:
+        return {}
+
+    results: Dict[str, Dict[str, object]] = {}
+    worker_count = min(DISCOVERY_DETAIL_LOOKUP_WORKERS, len(targets))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_key = {
+            executor.submit(fetch_video_detail_fields, video_url): key
+            for key, video_url in targets
+        }
+        for future in as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                results[key] = future.result()
+            except Exception as error:
+                results[key] = {"error": str(error)}
+    return results
+
+
+def merged_entry_with_detail(entry: Dict[str, object], detail: Dict[str, object]) -> Dict[str, object]:
+    if not detail or detail.get("error"):
+        return entry
+    merged = dict(entry)
+    for key, value in detail.items():
+        if key == "error" or value in (None, ""):
+            continue
+        if merged.get(key) in (None, ""):
+            merged[key] = value
+    return merged
+
+
+def ytdlp_extract_listing_range(listing_url: str, start_index: int, end_index: int) -> Dict[str, object]:
+    command = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--flat-playlist",
+        "--extractor-args",
+        "youtubetab:approximate_date=1",
+        "--dump-single-json",
+        listing_url,
+    ]
+    if start_index <= 1:
+        command[4:4] = ["--playlist-end", str(end_index)]
+    else:
+        command[4:4] = ["--playlist-items", f"{start_index}-{end_index}"]
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=DISCOVERY_YTDLP_LIST_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise TimeoutError(f"yt-dlp 列表抓取超过 {int(DISCOVERY_YTDLP_LIST_TIMEOUT_SECONDS)} 秒") from error
+
+    if completed.returncode != 0:
+        message = "\n".join(completed.stderr.splitlines()[-6:]).strip()
+        raise RuntimeError(message or "yt-dlp 列表抓取失败")
+
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("yt-dlp 列表返回内容无法解析") from error
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("yt-dlp 列表返回内容格式异常")
+    return payload
+
+
+def discover_source_videos(
+    source_url: str,
+    cutoff_date: date,
+    max_per_source: int,
+    detail_lookup_limit: int,
+    progress_callback: DiscoveryProgressCallback = None,
+    source_index: int = 1,
+    source_count: int = 1,
+) -> Dict[str, object]:
     listing_url = discovery_listing_url(source_url)
     is_single_video = bool(youtube_id_from_url(listing_url))
     if is_single_video:
         video_url = normalize_url(listing_url)
+        detail = fetch_video_detail_fields(video_url) if detail_lookup_limit > 0 else {}
+        publish_date = date_from_video_entry(detail)
         entry = {
             "id": youtube_id_from_url(listing_url),
             "url": video_url,
             "title": video_url,
             "channel": "",
             "channel_url": "",
-            "publish_date": "",
-            "date_known": False,
-            "in_range": None,
-            "duration_seconds": None,
-            "view_count": None,
+            "publish_date": publish_date.isoformat() if publish_date else "",
+            "date_known": publish_date is not None,
+            "in_range": publish_date >= cutoff_date if publish_date else None,
+            "duration_seconds": parse_duration_seconds(detail.get("duration")),
+            "view_count": number_or_none(detail.get("view_count")),
+            "thumbnail_url": thumbnail_url_from_entry({"id": youtube_id_from_url(listing_url)}, video_url),
             "description": "",
             "source_url": source_url,
         }
@@ -282,84 +787,228 @@ def discover_source_videos(source_url: str, cutoff_date: date, max_per_source: i
             "source_url": source_url,
             "listing_url": listing_url,
             "title": entry["title"],
+            "provider": "yt_dlp",
             "scanned_count": 1,
-            "included_count": 1,
-            "unknown_date_count": 1,
+            "included_count": len([entry] if not publish_date or publish_date >= cutoff_date else []),
+            "unknown_date_count": 0 if publish_date else 1,
+            "out_of_range_count": 0 if not publish_date or publish_date >= cutoff_date else 1,
+            "detail_lookup_count": 1 if detail_lookup_limit > 0 else 0,
+            "detail_lookup_success_count": 1 if publish_date else 0,
+            "detail_lookup_error_count": 1 if detail.get("error") else 0,
+            "detail_lookup_limit_reached": False,
             "limit_reached": False,
-            "items": [entry],
+            "items": [entry] if not publish_date or publish_date >= cutoff_date else [],
         }
 
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "extract_flat": "in_playlist",
-        "playlistend": max_per_source,
-        "ignoreerrors": True,
-        "socket_timeout": 20,
-        "extractor_args": {"youtube": {"approximate_date": ["1"]}},
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(listing_url, download=False)
+    api_error = ""
+    if YOUTUBE_DATA_API_KEY and is_youtube_url(listing_url):
+        try:
+            return youtube_api_discover_source_videos(
+                source_url,
+                cutoff_date,
+                max_per_source,
+                progress_callback=progress_callback,
+                source_index=source_index,
+                source_count=source_count,
+            )
+        except Exception as error:
+            api_error = str(error)
 
-    entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
+    requested_max_per_source = max_per_source
+    yt_dlp_max_per_source = min(max_per_source, DISCOVERY_YTDLP_MAX_PER_SOURCE_WITHOUT_API)
+    detail_lookup_limit = detail_lookup_limit_for(max_per_source, detail_lookup_limit)
     items = []
+    source_title = listing_url
+    source_description = ""
+    scanned_count = 0
     unknown_date_count = 0
-    for entry in entries:
-        video_url = video_url_from_entry(entry)
-        if not video_url:
-            continue
+    out_of_range_count = 0
+    detail_lookup_count = 0
+    detail_lookup_success_count = 0
+    detail_lookup_error_count = 0
+    detail_lookup_limit_reached = False
+    stopped_by_cutoff = False
+    ytdlp_batch_count = 0
+    seen_source_video_urls = set()
+    batch_start = 1
+    while batch_start <= yt_dlp_max_per_source:
+        batch_end = min(yt_dlp_max_per_source, batch_start + DISCOVERY_YTDLP_BATCH_SIZE - 1)
+        if progress_callback:
+            progress_callback(
+                {
+                    "event": "yt_dlp_batch_start",
+                    "source_url": source_url,
+                    "source_index": source_index,
+                    "source_count": source_count,
+                    "batch_index": ytdlp_batch_count + 1,
+                    "batch_start": batch_start,
+                    "batch_end": batch_end,
+                    "scanned_count": scanned_count,
+                    "included_count": len(items),
+                }
+            )
+        info = ytdlp_extract_listing_range(listing_url, batch_start, batch_end)
+        ytdlp_batch_count += 1
+        if ytdlp_batch_count == 1:
+            source_title = clean_scalar(info.get("title") or listing_url)
+            source_description = clean_scalar(info.get("description") or info.get("channel_description") or "")
 
-        publish_date = date_from_video_entry(entry)
-        date_known = publish_date is not None
-        in_range = publish_date >= cutoff_date if date_known else None
-        if date_known and not in_range:
-            continue
-        if not date_known:
-            unknown_date_count += 1
+        entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
+        if not entries:
+            break
 
-        duration_seconds = extract_video_duration_seconds(entry)
-        items.append(
-            {
-                "id": clean_scalar(entry.get("id") or youtube_id_from_url(video_url)),
-                "url": video_url,
-                "title": clean_scalar(entry.get("title") or video_url),
-                "channel": clean_scalar(entry.get("channel") or entry.get("uploader") or info.get("channel") or info.get("uploader") or ""),
-                "channel_url": clean_scalar(entry.get("channel_url") or entry.get("uploader_url") or info.get("channel_url") or ""),
-                "publish_date": publish_date.isoformat() if publish_date else "",
-                "date_known": date_known,
-                "in_range": in_range,
-                "duration_seconds": round(duration_seconds, 3) if duration_seconds is not None else None,
-                "view_count": number_or_none(entry.get("view_count")),
-                "description": clean_scalar(entry.get("description") or ""),
-                "source_url": source_url,
-            }
+        remaining_detail_limit = max(0, detail_lookup_limit - detail_lookup_count)
+        detail_by_url = fetch_detail_fields_for(entries, remaining_detail_limit)
+        detail_lookup_count += len(detail_by_url)
+        detail_lookup_success_count += sum(
+            1
+            for detail in detail_by_url.values()
+            if not detail.get("error") and date_from_video_entry(detail) is not None
         )
+        detail_lookup_error_count += sum(1 for detail in detail_by_url.values() if detail.get("error"))
+        detail_lookup_limit_reached = detail_lookup_limit_reached or (
+            sum(1 for entry in entries if date_from_video_entry(entry) is None) > len(detail_by_url)
+        )
+
+        for entry in entries:
+            scanned_count += 1
+            video_url = video_url_from_entry(entry)
+            if not video_url:
+                continue
+
+            normalized_video_url = normalize_url(video_url)
+            if normalized_video_url in seen_source_video_urls:
+                continue
+            seen_source_video_urls.add(normalized_video_url)
+
+            detail = detail_by_url.get(normalized_video_url, {})
+            entry = merged_entry_with_detail(entry, detail)
+            publish_date = date_from_video_entry(entry)
+            date_known = publish_date is not None
+            in_range = publish_date >= cutoff_date if date_known else None
+            if not date_known:
+                unknown_date_count += 1
+                continue
+            if not in_range:
+                out_of_range_count += 1
+                stopped_by_cutoff = True
+                break
+
+            duration_seconds = extract_video_duration_seconds(entry)
+            items.append(
+                {
+                    "id": clean_scalar(entry.get("id") or youtube_id_from_url(video_url)),
+                    "url": video_url,
+                    "title": clean_scalar(entry.get("title") or video_url),
+                    "channel": clean_scalar(entry.get("channel") or entry.get("uploader") or info.get("channel") or info.get("uploader") or ""),
+                    "channel_url": clean_scalar(entry.get("channel_url") or entry.get("uploader_url") or info.get("channel_url") or ""),
+                    "publish_date": publish_date.isoformat() if publish_date else "",
+                    "date_known": date_known,
+                    "in_range": in_range,
+                    "duration_seconds": round(duration_seconds, 3) if duration_seconds is not None else None,
+                    "view_count": number_or_none(entry.get("view_count")),
+                    "thumbnail_url": thumbnail_url_from_entry(entry, video_url),
+                    "description": clean_scalar(entry.get("description") or ""),
+                    "source_url": source_url,
+                    "date_source": "yt_dlp_approximate",
+                }
+            )
+
+        if stopped_by_cutoff or len(entries) < (batch_end - batch_start + 1):
+            if progress_callback:
+                progress_callback(
+                    {
+                        "event": "yt_dlp_batch_done",
+                        "source_url": source_url,
+                        "source_index": source_index,
+                        "source_count": source_count,
+                        "batch_index": ytdlp_batch_count,
+                        "batch_start": batch_start,
+                        "batch_end": batch_end,
+                        "scanned_count": scanned_count,
+                        "included_count": len(items),
+                        "stopped_by_cutoff": stopped_by_cutoff,
+                    }
+                )
+            break
+        if progress_callback:
+            progress_callback(
+                {
+                    "event": "yt_dlp_batch_done",
+                    "source_url": source_url,
+                    "source_index": source_index,
+                    "source_count": source_count,
+                    "batch_index": ytdlp_batch_count,
+                    "batch_start": batch_start,
+                    "batch_end": batch_end,
+                    "scanned_count": scanned_count,
+                    "included_count": len(items),
+                    "stopped_by_cutoff": stopped_by_cutoff,
+                }
+            )
+        batch_start = batch_end + 1
 
     return {
         "source_url": source_url,
         "listing_url": listing_url,
-        "title": clean_scalar(info.get("title") or listing_url),
-        "description": clean_scalar(info.get("description") or info.get("channel_description") or ""),
-        "scanned_count": len(entries),
+        "title": source_title,
+        "description": source_description,
+        "provider": "yt_dlp",
+        "provider_fallback_reason": api_error,
+        "scanned_count": scanned_count,
         "included_count": len(items),
         "unknown_date_count": unknown_date_count,
-        "limit_reached": len(entries) >= max_per_source,
+        "out_of_range_count": out_of_range_count,
+        "detail_lookup_count": detail_lookup_count,
+        "detail_lookup_success_count": detail_lookup_success_count,
+        "detail_lookup_error_count": detail_lookup_error_count,
+        "detail_lookup_limit_reached": detail_lookup_limit_reached,
+        "yt_dlp_batch_count": ytdlp_batch_count,
+        "yt_dlp_batch_size": DISCOVERY_YTDLP_BATCH_SIZE,
+        "stopped_by_cutoff": stopped_by_cutoff,
+        "yt_dlp_capped": yt_dlp_max_per_source < requested_max_per_source,
+        "requested_max_per_source": requested_max_per_source,
+        "limit_reached": scanned_count >= yt_dlp_max_per_source,
         "items": items,
     }
 
 
-def discover_videos(sources: List[str], range_text: str, max_per_source: int) -> Dict[str, object]:
+def discover_videos(
+    sources: List[str],
+    range_text: str,
+    max_per_source: int,
+    detail_lookup_limit: int,
+    progress_callback: DiscoveryProgressCallback = None,
+) -> Dict[str, object]:
     cutoff_date = parse_discovery_range(range_text)
     max_per_source = max(1, min(max_per_source, DISCOVERY_HARD_MAX_PER_SOURCE))
+    detail_lookup_limit = detail_lookup_limit_for(max_per_source, detail_lookup_limit)
 
     all_items = []
     source_results = []
     seen_urls = set()
-    for source_url in sources:
+    source_count = len(sources)
+    for source_index, source_url in enumerate(sources, start=1):
         started = time.monotonic()
+        if progress_callback:
+            progress_callback(
+                {
+                    "event": "source_start",
+                    "source_url": source_url,
+                    "source_index": source_index,
+                    "source_count": source_count,
+                }
+            )
         try:
-            result = discover_source_videos(source_url, cutoff_date, max_per_source)
+            result = discover_source_videos(
+                source_url,
+                cutoff_date,
+                max_per_source,
+                detail_lookup_limit,
+                progress_callback=progress_callback,
+                source_index=source_index,
+                source_count=source_count,
+            )
             result["elapsed_seconds"] = round(time.monotonic() - started, 3)
             unique_items = []
             for item in result.pop("items"):
@@ -372,6 +1021,18 @@ def discover_videos(sources: List[str], range_text: str, max_per_source: int) ->
             result["included_count"] = len(unique_items)
             all_items.extend(unique_items)
             source_results.append(result)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "event": "source_done",
+                        "source_url": source_url,
+                        "source_index": source_index,
+                        "source_count": source_count,
+                        "scanned_count": result.get("scanned_count", 0),
+                        "included_count": result.get("included_count", 0),
+                        "stopped_by_cutoff": result.get("stopped_by_cutoff", False),
+                    }
+                )
         except Exception as error:
             source_results.append(
                 {
@@ -386,14 +1047,29 @@ def discover_videos(sources: List[str], range_text: str, max_per_source: int) ->
                     "error": str(error),
                 }
             )
+            if progress_callback:
+                progress_callback(
+                    {
+                        "event": "source_error",
+                        "source_url": source_url,
+                        "source_index": source_index,
+                        "source_count": source_count,
+                        "error": str(error),
+                    }
+                )
 
     all_items.sort(key=lambda item: item.get("publish_date") or "0000-00-00", reverse=True)
+    provider_counts = {}
+    for source in source_results:
+        provider = clean_scalar(source.get("provider") or "unknown")
+        provider_counts[provider] = provider_counts.get(provider, 0) + 1
     return {
         "range": {
             "input": range_text,
             "cutoff_date": cutoff_date.isoformat(),
         },
         "max_per_source": max_per_source,
+        "detail_lookup_limit": detail_lookup_limit,
         "items": all_items,
         "sources": source_results,
         "summary": {
@@ -401,10 +1077,72 @@ def discover_videos(sources: List[str], range_text: str, max_per_source: int) ->
             "video_count": len(all_items),
             "scanned_count": sum(int(source.get("scanned_count") or 0) for source in source_results),
             "unknown_date_count": sum(int(source.get("unknown_date_count") or 0) for source in source_results),
+            "out_of_range_count": sum(int(source.get("out_of_range_count") or 0) for source in source_results),
+            "detail_lookup_count": sum(int(source.get("detail_lookup_count") or 0) for source in source_results),
+            "detail_lookup_success_count": sum(int(source.get("detail_lookup_success_count") or 0) for source in source_results),
+            "detail_lookup_error_count": sum(int(source.get("detail_lookup_error_count") or 0) for source in source_results),
+            "detail_lookup_limit_reached_count": sum(1 for source in source_results if source.get("detail_lookup_limit_reached")),
+            "api_request_count": sum(int(source.get("api_request_count") or 0) for source in source_results),
+            "yt_dlp_batch_count": sum(int(source.get("yt_dlp_batch_count") or 0) for source in source_results),
+            "yt_dlp_batch_size": DISCOVERY_YTDLP_BATCH_SIZE,
+            "stopped_by_cutoff_count": sum(1 for source in source_results if source.get("stopped_by_cutoff")),
+            "provider_counts": provider_counts,
+            "fallback_count": sum(1 for source in source_results if source.get("provider_fallback_reason")),
+            "yt_dlp_capped_count": sum(1 for source in source_results if source.get("yt_dlp_capped")),
+            "yt_dlp_cap": DISCOVERY_YTDLP_MAX_PER_SOURCE_WITHOUT_API,
+            "youtube_api_configured": bool(YOUTUBE_DATA_API_KEY),
             "error_count": sum(1 for source in source_results if source.get("error")),
             "limit_reached_count": sum(1 for source in source_results if source.get("limit_reached")),
         },
     }
+
+
+def strict_discovery_record(record: Dict[str, object]) -> Dict[str, object]:
+    cutoff_date = date_from_iso_text((record.get("range") or {}).get("cutoff_date"))
+    if cutoff_date is None:
+        return record
+
+    original_items = [item for item in (record.get("items") or []) if isinstance(item, dict)]
+    filtered_items = []
+    skipped_unknown = 0
+    for item in original_items:
+        publish_date = date_from_iso_text(item.get("publish_date"))
+        if publish_date is None:
+            skipped_unknown += 1
+            continue
+        if publish_date < cutoff_date:
+            continue
+        filtered_item = dict(item)
+        filtered_item["date_known"] = True
+        filtered_item["in_range"] = True
+        filtered_items.append(filtered_item)
+
+    if len(filtered_items) == len(original_items) and not skipped_unknown:
+        return record
+
+    normalized = dict(record)
+    normalized["items"] = filtered_items
+    source_counts: Dict[str, int] = {}
+    for item in filtered_items:
+        source_url = clean_scalar(item.get("source_url"))
+        if not source_url:
+            continue
+        source_key = channel_listing_key(source_url)
+        source_counts[source_key] = source_counts.get(source_key, 0) + 1
+    normalized_sources = []
+    for source in record.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        normalized_source = dict(source)
+        source_key = channel_listing_key(clean_scalar(source.get("source_url") or source.get("listing_url")))
+        normalized_source["included_count"] = source_counts.get(source_key, 0)
+        normalized_sources.append(normalized_source)
+    normalized["sources"] = normalized_sources
+    summary = dict(normalized.get("summary") or {})
+    summary["video_count"] = len(filtered_items)
+    summary["unknown_date_count"] = max(int(summary.get("unknown_date_count") or 0), skipped_unknown)
+    normalized["summary"] = summary
+    return normalized
 
 
 def channel_listing_key(source_url: str) -> str:
@@ -469,7 +1207,7 @@ def save_channel_items(channel_id: str, items: List[Dict[str, object]]) -> None:
 
 
 def channel_summary(channel: Dict[str, object]) -> Dict[str, object]:
-    return {
+    payload = {
         "id": channel.get("id", ""),
         "source_url": channel.get("source_url", ""),
         "listing_url": channel.get("listing_url", ""),
@@ -486,6 +1224,20 @@ def channel_summary(channel: Dict[str, object]) -> Dict[str, object]:
         "limit_reached": bool(channel.get("limit_reached", False)),
         "last_error": clean_scalar(channel.get("last_error") or ""),
     }
+    if payload.get("last_discovery_id"):
+        try:
+            record = load_discovery_record(str(payload["last_discovery_id"]))
+            source_key = channel_listing_key(clean_scalar(payload.get("source_url") or payload.get("listing_url")))
+            items = [
+                item for item in (record.get("items") or [])
+                if isinstance(item, dict)
+                and channel_listing_key(clean_scalar(item.get("source_url") or payload.get("source_url"))) == source_key
+            ]
+            payload["video_count"] = len(items)
+            payload["known_date_count"] = sum(1 for item in items if item.get("date_known"))
+        except Exception:
+            pass
+    return payload
 
 
 def list_followed_channels() -> List[Dict[str, object]]:
@@ -599,19 +1351,268 @@ def get_followed_channel(channel_id: str) -> Dict[str, object]:
         if not channel:
             raise ValueError("Channel not found.")
         payload = channel_summary(channel)
-        payload["items"] = channel_items_for(str(payload["id"]))
+        items = channel_items_for(str(payload["id"]))
+        if payload.get("last_discovery_id"):
+            try:
+                record = load_discovery_record(str(payload["last_discovery_id"]))
+                allowed_urls = {
+                    normalize_url(clean_scalar(item.get("url")))
+                    for item in (record.get("items") or [])
+                    if isinstance(item, dict) and clean_scalar(item.get("url"))
+                }
+                items = [item for item in items if normalize_url(clean_scalar(item.get("url"))) in allowed_urls]
+            except Exception:
+                pass
+        payload["items"] = items
+        payload["video_count"] = len(items)
+        payload["known_date_count"] = sum(1 for item in items if item.get("date_known"))
         return payload
 
 
-def refresh_followed_channel(channel_id: str, range_text: str, max_per_source: int) -> Dict[str, object]:
+def refresh_followed_channel(
+    channel_id: str,
+    range_text: str,
+    max_per_source: int,
+    detail_lookup_limit: int,
+) -> Dict[str, object]:
     channel = get_followed_channel(channel_id)
     source = clean_scalar(channel.get("source_url") or channel.get("listing_url"))
-    record = create_discovery_record([source], range_text, max_per_source)
+    record = create_discovery_record([source], range_text, max_per_source, detail_lookup_limit)
     return {
         "record": record,
         "channel": get_followed_channel(channel_id),
         "channels": list_followed_channels(),
     }
+
+
+def discovery_units_per_source(max_per_source: int) -> int:
+    limit = max(1, min(max_per_source, DISCOVERY_HARD_MAX_PER_SOURCE))
+    if not YOUTUBE_DATA_API_KEY:
+        limit = min(limit, DISCOVERY_YTDLP_MAX_PER_SOURCE_WITHOUT_API)
+        unit_size = DISCOVERY_YTDLP_BATCH_SIZE
+    else:
+        unit_size = 50
+    return max(1, (limit + unit_size - 1) // unit_size)
+
+
+def discovery_task_to_dict(task: DiscoveryTask) -> Dict[str, object]:
+    payload = {
+        "id": task.id,
+        "kind": task.kind,
+        "channel_id": task.channel_id,
+        "status": task.status,
+        "current": task.current,
+        "total": task.total,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+        "started_at": task.started_at,
+        "completed_at": task.completed_at,
+        "message": task.message,
+        "record_id": task.record_id,
+        "error": task.error,
+        "sources": task.sources,
+        "range": task.range_text,
+        "max_per_source": task.max_per_source,
+        "detail_lookup_limit": task.detail_lookup_limit,
+        "source_progress": task.source_progress,
+    }
+    if task.result is not None and task.status in {"completed", "completed_with_errors"}:
+        payload["result"] = task.result
+    return payload
+
+
+def update_discovery_task(task_id: str, **changes) -> None:
+    with discovery_tasks_lock:
+        task = discovery_tasks[task_id]
+        for key, value in changes.items():
+            setattr(task, key, value)
+        task.updated_at = time.time()
+
+
+def discovery_progress_callback(task_id: str) -> Callable[[Dict[str, object]], None]:
+    def callback(event: Dict[str, object]) -> None:
+        with discovery_tasks_lock:
+            task = discovery_tasks.get(task_id)
+            if not task:
+                return
+            units_per_source = max(1, discovery_units_per_source(task.max_per_source))
+            source_index = max(1, int(event.get("source_index") or 1))
+            source_count = max(1, int(event.get("source_count") or len(task.sources) or 1))
+            source_url = clean_scalar(event.get("source_url") or "")
+            base = (source_index - 1) * units_per_source
+            event_name = clean_scalar(event.get("event") or "")
+            source_row = None
+            if 1 <= source_index <= len(task.source_progress):
+                source_row = task.source_progress[source_index - 1]
+
+            if event_name == "source_start":
+                task.current = max(task.current, min(task.total, base))
+                task.message = f"频道 {source_index}/{source_count}：准备扫描 {source_url}"
+                if source_row is not None:
+                    source_row.update(
+                        {
+                            "status": "running",
+                            "current": 0,
+                            "message": "准备扫描",
+                        }
+                    )
+            elif event_name in {"yt_dlp_batch_start", "api_page_start"}:
+                batch_index = max(1, int(event.get("batch_index") or event.get("page_index") or 1))
+                start = event.get("batch_start")
+                end = event.get("batch_end")
+                task.current = max(task.current, min(task.total, base + batch_index - 1))
+                if start and end:
+                    task.message = f"频道 {source_index}/{source_count}：扫描第 {batch_index} 批（{start}-{end}）"
+                else:
+                    task.message = f"频道 {source_index}/{source_count}：读取第 {batch_index} 页"
+                if source_row is not None:
+                    source_row.update(
+                        {
+                            "status": "running",
+                            "current": max(0, batch_index - 1),
+                            "message": task.message,
+                        }
+                    )
+            elif event_name in {"yt_dlp_batch_done", "api_page_done"}:
+                batch_index = max(1, int(event.get("batch_index") or event.get("page_index") or 1))
+                scanned_count = int(event.get("scanned_count") or 0)
+                included_count = int(event.get("included_count") or 0)
+                task.current = max(task.current, min(task.total, base + batch_index))
+                suffix = "，已到时间边界" if event.get("stopped_by_cutoff") else ""
+                task.message = f"频道 {source_index}/{source_count}：已扫 {scanned_count} 条，候选 {included_count} 条{suffix}"
+                if source_row is not None:
+                    source_row.update(
+                        {
+                            "status": "running",
+                            "current": min(units_per_source, batch_index),
+                            "scanned_count": scanned_count,
+                            "included_count": included_count,
+                            "message": f"已扫 {scanned_count} 条，候选 {included_count} 条{suffix}",
+                        }
+                    )
+            elif event_name == "source_done":
+                included_count = int(event.get("included_count") or 0)
+                scanned_count = int(event.get("scanned_count") or 0)
+                task.current = max(task.current, min(task.total, source_index * units_per_source))
+                task.message = f"频道 {source_index}/{source_count} 完成：已扫 {scanned_count} 条，候选 {included_count} 条"
+                if source_row is not None:
+                    source_row.update(
+                        {
+                            "status": "completed",
+                            "current": units_per_source,
+                            "scanned_count": scanned_count,
+                            "included_count": included_count,
+                            "message": f"完成：已扫 {scanned_count} 条，候选 {included_count} 条",
+                        }
+                    )
+            elif event_name == "source_error":
+                task.current = max(task.current, min(task.total, source_index * units_per_source))
+                task.message = f"频道 {source_index}/{source_count} 失败：{clean_scalar(event.get('error') or '')}"
+                if source_row is not None:
+                    source_row.update(
+                        {
+                            "status": "failed",
+                            "current": units_per_source,
+                            "message": clean_scalar(event.get("error") or "扫描失败"),
+                        }
+                    )
+            task.updated_at = time.time()
+    return callback
+
+
+def process_discovery_task(task_id: str) -> None:
+    with discovery_tasks_lock:
+        task = discovery_tasks[task_id]
+        task.status = "running"
+        task.started_at = time.time()
+        task.message = "扫描任务已开始"
+        task.updated_at = time.time()
+        sources = list(task.sources)
+        range_text = task.range_text
+        max_per_source = task.max_per_source
+        detail_lookup_limit = task.detail_lookup_limit
+        kind = task.kind
+        channel_id = task.channel_id
+
+    try:
+        record = create_discovery_record(
+            sources,
+            range_text,
+            max_per_source,
+            detail_lookup_limit,
+            progress_callback=discovery_progress_callback(task_id),
+        )
+        if kind == "channel_refresh" and channel_id:
+            result = {
+                "record": record,
+                "channel": get_followed_channel(channel_id),
+                "channels": list_followed_channels(),
+            }
+        else:
+            result = record
+        with discovery_tasks_lock:
+            task = discovery_tasks[task_id]
+            task.status = "completed"
+            task.current = task.total
+            task.completed_at = time.time()
+            task.record_id = clean_scalar(record.get("id") or "")
+            task.result = result
+            task.message = "扫描完成"
+            task.updated_at = time.time()
+    except Exception as error:
+        with discovery_tasks_lock:
+            task = discovery_tasks[task_id]
+            task.status = "failed"
+            task.completed_at = time.time()
+            task.error = str(error)
+            task.message = f"扫描失败：{error}"
+            task.updated_at = time.time()
+        traceback.print_exc()
+
+
+def create_discovery_task(
+    sources: List[str],
+    range_text: str,
+    max_per_source: int,
+    detail_lookup_limit: int,
+    kind: str = "discover",
+    channel_id: str = "",
+) -> Dict[str, object]:
+    max_per_source = max(1, min(max_per_source, DISCOVERY_HARD_MAX_PER_SOURCE))
+    detail_lookup_limit = detail_lookup_limit_for(max_per_source, detail_lookup_limit)
+    task_id = uuid.uuid4().hex[:12]
+    units_per_source = discovery_units_per_source(max_per_source)
+    total = max(1, len(sources) * units_per_source)
+    source_progress = [
+        {
+            "source_url": source,
+            "index": index,
+            "status": "queued",
+            "current": 0,
+            "total": units_per_source,
+            "scanned_count": 0,
+            "included_count": 0,
+            "message": "等待扫描",
+        }
+        for index, source in enumerate(sources, start=1)
+    ]
+    task = DiscoveryTask(
+        id=task_id,
+        sources=sources,
+        range_text=range_text,
+        max_per_source=max_per_source,
+        detail_lookup_limit=detail_lookup_limit,
+        kind=kind,
+        channel_id=channel_id,
+        total=total,
+        message="扫描任务已排队",
+        source_progress=source_progress,
+    )
+    with discovery_tasks_lock:
+        discovery_tasks[task_id] = task
+    thread = threading.Thread(target=process_discovery_task, args=(task_id,), daemon=True)
+    thread.start()
+    return discovery_task_to_dict(task)
 
 
 def safe_discovery_id(value: str) -> str:
@@ -626,6 +1627,7 @@ def discovery_record_path(record_id: str) -> Path:
 
 
 def discovery_record_summary(record: Dict[str, object]) -> Dict[str, object]:
+    record = strict_discovery_record(record)
     summary = dict(record.get("summary") or {})
     return {
         "id": record.get("id", ""),
@@ -633,10 +1635,25 @@ def discovery_record_summary(record: Dict[str, object]) -> Dict[str, object]:
         "updated_at": record.get("updated_at"),
         "range": record.get("range"),
         "max_per_source": record.get("max_per_source"),
+        "detail_lookup_limit": record.get("detail_lookup_limit"),
         "source_count": summary.get("source_count", 0),
         "video_count": summary.get("video_count", 0),
         "scanned_count": summary.get("scanned_count", 0),
         "unknown_date_count": summary.get("unknown_date_count", 0),
+        "out_of_range_count": summary.get("out_of_range_count", 0),
+        "detail_lookup_count": summary.get("detail_lookup_count", 0),
+        "detail_lookup_success_count": summary.get("detail_lookup_success_count", 0),
+        "detail_lookup_error_count": summary.get("detail_lookup_error_count", 0),
+        "detail_lookup_limit_reached_count": summary.get("detail_lookup_limit_reached_count", 0),
+        "api_request_count": summary.get("api_request_count", 0),
+        "yt_dlp_batch_count": summary.get("yt_dlp_batch_count", 0),
+        "yt_dlp_batch_size": summary.get("yt_dlp_batch_size", DISCOVERY_YTDLP_BATCH_SIZE),
+        "stopped_by_cutoff_count": summary.get("stopped_by_cutoff_count", 0),
+        "provider_counts": summary.get("provider_counts", {}),
+        "fallback_count": summary.get("fallback_count", 0),
+        "yt_dlp_capped_count": summary.get("yt_dlp_capped_count", 0),
+        "yt_dlp_cap": summary.get("yt_dlp_cap", DISCOVERY_YTDLP_MAX_PER_SOURCE_WITHOUT_API),
+        "youtube_api_configured": summary.get("youtube_api_configured", bool(YOUTUBE_DATA_API_KEY)),
         "error_count": summary.get("error_count", 0),
         "limit_reached_count": summary.get("limit_reached_count", 0),
         "sources": record.get("sources_input") or [],
@@ -661,7 +1678,7 @@ def load_discovery_record(record_id: str) -> Dict[str, object]:
     path = discovery_record_path(record_id)
     if not path.exists():
         raise ValueError("Discovery record not found.")
-    return json.loads(path.read_text(encoding="utf-8"))
+    return strict_discovery_record(json.loads(path.read_text(encoding="utf-8")))
 
 
 def list_discovery_records() -> List[Dict[str, object]]:
@@ -677,8 +1694,14 @@ def list_discovery_records() -> List[Dict[str, object]]:
     return records
 
 
-def create_discovery_record(sources: List[str], range_text: str, max_per_source: int) -> Dict[str, object]:
-    record = discover_videos(sources, range_text, max_per_source)
+def create_discovery_record(
+    sources: List[str],
+    range_text: str,
+    max_per_source: int,
+    detail_lookup_limit: int,
+    progress_callback: DiscoveryProgressCallback = None,
+) -> Dict[str, object]:
+    record = discover_videos(sources, range_text, max_per_source, detail_lookup_limit, progress_callback=progress_callback)
     now = time.time()
     record.update(
         {
@@ -700,7 +1723,8 @@ def refresh_discovery_record(record_id: str) -> Dict[str, object]:
     sources = [clean_scalar(source) for source in (previous.get("sources_input") or []) if clean_scalar(source)]
     range_text = clean_scalar(previous.get("range_input") or (previous.get("range") or {}).get("input") or "1年")
     max_per_source = int(previous.get("max_per_source") or DISCOVERY_DEFAULT_MAX_PER_SOURCE)
-    record = discover_videos(sources, range_text, max_per_source)
+    detail_lookup_limit = int_or_default(previous.get("detail_lookup_limit"), DISCOVERY_DEFAULT_DETAIL_LOOKUP_LIMIT)
+    record = discover_videos(sources, range_text, max_per_source, detail_lookup_limit)
     now = time.time()
     record.update(
         {
@@ -1234,6 +2258,8 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.handle_channels_list()
         if path.startswith("/api/channels/"):
             return self.handle_channel_get(path)
+        if path.startswith("/api/discovery-tasks/"):
+            return self.handle_discovery_task_get(path)
         if path == "/api/discoveries":
             return self.handle_discoveries_list()
         if path.startswith("/api/discoveries/"):
@@ -1251,6 +2277,8 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.handle_add_channels()
         if parsed.path.startswith("/api/channels/"):
             return self.handle_channel_post(parsed.path)
+        if parsed.path == "/api/discovery-tasks":
+            return self.handle_create_discovery_task()
         if parsed.path == "/api/discover":
             return self.handle_discover()
         if parsed.path.startswith("/api/discoveries/"):
@@ -1326,14 +2354,68 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
         return self.send_json(result, HTTPStatus.CREATED)
 
+    def handle_create_discovery_task(self):
+        try:
+            payload = self.read_json_body()
+            channel_id = clean_scalar(payload.get("channel_id") or "")
+            if channel_id:
+                channel = get_followed_channel(channel_id)
+                source = clean_scalar(channel.get("source_url") or channel.get("listing_url"))
+                if not source:
+                    raise ValueError("Channel has no source URL.")
+                sources = [source]
+                kind = "channel_refresh"
+            else:
+                raw_sources = payload.get("sources", "")
+                if isinstance(raw_sources, list):
+                    raw_sources = "\n".join(str(item) for item in raw_sources)
+                sources = parse_discovery_sources(str(raw_sources))
+                kind = "discover"
+            range_text = clean_scalar(payload.get("range") or "1年")
+            max_per_source = int_or_default(payload.get("max_per_source"), DISCOVERY_DEFAULT_MAX_PER_SOURCE)
+            detail_lookup_limit = int_or_default(
+                payload.get("detail_lookup_limit"),
+                DISCOVERY_DEFAULT_DETAIL_LOOKUP_LIMIT,
+            )
+            result = create_discovery_task(
+                sources,
+                range_text,
+                max_per_source,
+                detail_lookup_limit,
+                kind=kind,
+                channel_id=channel_id,
+            )
+        except ValueError as error:
+            status = HTTPStatus.NOT_FOUND if "Channel" in str(error) else HTTPStatus.BAD_REQUEST
+            return self.send_json({"error": str(error)}, status)
+        except Exception as error:
+            return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        return self.send_json(result, HTTPStatus.CREATED)
+
+    def handle_discovery_task_get(self, path: str):
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) != 3:
+            return self.send_error(HTTPStatus.NOT_FOUND)
+        task_id = parts[2]
+        with discovery_tasks_lock:
+            task = discovery_tasks.get(task_id)
+            payload = discovery_task_to_dict(task) if task else None
+        if not payload:
+            return self.send_json({"error": "Discovery task not found."}, HTTPStatus.NOT_FOUND)
+        return self.send_json(payload)
+
     def handle_channel_post(self, path: str):
         parts = [unquote(part) for part in path.split("/") if part]
         if len(parts) == 4 and parts[3] == "refresh":
             try:
                 payload = self.read_json_body()
                 range_text = clean_scalar(payload.get("range") or "1年")
-                max_per_source = int(payload.get("max_per_source") or DISCOVERY_DEFAULT_MAX_PER_SOURCE)
-                return self.send_json(refresh_followed_channel(parts[2], range_text, max_per_source))
+                max_per_source = int_or_default(payload.get("max_per_source"), DISCOVERY_DEFAULT_MAX_PER_SOURCE)
+                detail_lookup_limit = int_or_default(
+                    payload.get("detail_lookup_limit"),
+                    DISCOVERY_DEFAULT_DETAIL_LOOKUP_LIMIT,
+                )
+                return self.send_json(refresh_followed_channel(parts[2], range_text, max_per_source, detail_lookup_limit))
             except ValueError as error:
                 return self.send_json({"error": str(error)}, HTTPStatus.NOT_FOUND)
             except Exception as error:
@@ -1348,8 +2430,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 raw_sources = "\n".join(str(item) for item in raw_sources)
             sources = parse_discovery_sources(str(raw_sources))
             range_text = clean_scalar(payload.get("range") or "1年")
-            max_per_source = int(payload.get("max_per_source") or DISCOVERY_DEFAULT_MAX_PER_SOURCE)
-            result = create_discovery_record(sources, range_text, max_per_source)
+            max_per_source = int_or_default(payload.get("max_per_source"), DISCOVERY_DEFAULT_MAX_PER_SOURCE)
+            detail_lookup_limit = int_or_default(
+                payload.get("detail_lookup_limit"),
+                DISCOVERY_DEFAULT_DETAIL_LOOKUP_LIMIT,
+            )
+            result = create_discovery_record(sources, range_text, max_per_source, detail_lookup_limit)
         except ValueError as error:
             status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE if "too large" in str(error) else HTTPStatus.BAD_REQUEST
             return self.send_json({"error": str(error)}, status)

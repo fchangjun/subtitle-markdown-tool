@@ -334,12 +334,92 @@ button:disabled {
   background: #d8e2dc;
 }
 
-#progressBar {
+#progressBar,
+.progress-fill {
   width: 0%;
   height: 100%;
   border-radius: inherit;
   background: linear-gradient(90deg, var(--accent), var(--blue));
   transition: width 0.25s ease;
+}
+
+.discovery-progress {
+  margin-top: 12px;
+}
+
+.discovery-progress-message {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.discovery-source-progress {
+  margin-top: 12px;
+  display: grid;
+  gap: 8px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.discovery-source-progress-item {
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: white;
+}
+
+.discovery-source-progress-item.running {
+  border-color: rgba(47, 132, 104, 0.42);
+  background: #f5fbf8;
+}
+
+.discovery-source-progress-item.completed {
+  background: #f7faf8;
+}
+
+.discovery-source-progress-item.failed {
+  border-color: rgba(183, 75, 75, 0.5);
+  background: #fff7f7;
+}
+
+.discovery-source-progress-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.discovery-source-progress-title {
+  min-width: 0;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 760;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.source-progress-track {
+  height: 5px;
+  margin-top: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #d8e2dc;
+}
+
+.source-progress-track div {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+
+.discovery-source-progress-message {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .summary-grid {
@@ -410,7 +490,7 @@ button:disabled {
 .discovery-controls {
   margin-top: 10px;
   display: grid;
-  grid-template-columns: minmax(140px, 1fr) minmax(120px, 0.7fr);
+  grid-template-columns: minmax(130px, 1fr) minmax(116px, 0.72fr) minmax(116px, 0.72fr);
   gap: 10px;
 }
 
@@ -507,11 +587,42 @@ button:disabled {
   min-height: 460px;
 }
 
+.discovery-group {
+  display: grid;
+  gap: 8px;
+}
+
+.discovery-group + .discovery-group {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.discovery-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f4f7f5;
+}
+
+.discovery-group-title {
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 780;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .discovery-item {
   padding: 10px;
   display: grid;
-  grid-template-columns: auto 1fr;
+  grid-template-columns: auto minmax(112px, 150px) minmax(0, 1fr);
   gap: 10px;
+  align-items: start;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fbfcfb;
@@ -522,6 +633,45 @@ button:disabled {
   height: 18px;
   margin-top: 2px;
   accent-color: var(--accent);
+}
+
+.video-thumbnail {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  display: block;
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #edf1ee;
+}
+
+.video-thumbnail img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.video-thumbnail.missing::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 0;
+  height: 0;
+  transform: translate(-38%, -50%);
+  border-top: 12px solid transparent;
+  border-bottom: 12px solid transparent;
+  border-left: 18px solid #9ca8a1;
+}
+
+.discovery-thumbnail {
+  align-self: start;
+}
+
+.discovery-info {
+  min-width: 0;
 }
 
 .discovery-title {
@@ -658,7 +808,10 @@ button:disabled {
 .channel-video-item {
   padding: 8px 9px;
   display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
   gap: 2px;
+  column-gap: 10px;
+  align-items: center;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: white;
@@ -667,6 +820,16 @@ button:disabled {
 
 .channel-video-item:hover {
   border-color: var(--accent);
+}
+
+.channel-thumbnail {
+  width: 92px;
+}
+
+.channel-video-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
 }
 
 .channel-video-title {
@@ -905,6 +1068,19 @@ button:disabled {
 
   .channel-detail-actions {
     justify-content: flex-start;
+  }
+
+  .discovery-item {
+    grid-template-columns: auto 88px minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .channel-video-item {
+    grid-template-columns: 82px minmax(0, 1fr);
+  }
+
+  .channel-thumbnail {
+    width: 82px;
   }
 
   .result-item {
