@@ -15,14 +15,16 @@ import argparse
 import csv
 import hashlib
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Callable, Dict, List, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import requests
 
@@ -44,6 +46,7 @@ from youtube_subtitles_to_md import (
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 OUTPUT_DIR = ROOT / "web_outputs"
+ENV_PATH = ROOT / ".env"
 DISCOVERY_DIR = OUTPUT_DIR / "discoveries"
 CHANNELS_DIR = OUTPUT_DIR / "channels"
 CHANNEL_INDEX_PATH = CHANNELS_DIR / "index.json"
@@ -68,7 +71,7 @@ def load_env_file(path: Path) -> None:
             os.environ[key] = value
 
 
-load_env_file(ROOT / ".env")
+load_env_file(ENV_PATH)
 
 
 def env_int(name: str, default: int) -> int:
@@ -83,6 +86,22 @@ def env_float(name: str, default: float) -> float:
         return float(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = clean_scalar(os.environ.get(name))
+    if not value:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def normalize_discovery_provider(value: object) -> str:
+    value = clean_scalar(value).lower().replace("-", "_")
+    if value in {"youtube_api", "api", "youtube"}:
+        return "youtube_api"
+    if value in {"yt_dlp", "ytdlp", "yt-dlp"}:
+        return "yt_dlp"
+    return ""
 
 
 def int_or_default(value: object, default: int) -> int:
@@ -103,12 +122,15 @@ AUTO_BATCH_SIZE = max(0, env_int("SUBTITLE_AUTO_BATCH_SIZE", 30))
 AUTO_BATCH_COOLDOWN_SECONDS = max(0.0, env_float("SUBTITLE_AUTO_BATCH_COOLDOWN_SECONDS", 300.0))
 IP_BLOCK_COOLDOWN_SECONDS = max(0.0, env_float("SUBTITLE_IP_BLOCK_COOLDOWN_SECONDS", 900.0))
 DISCOVERY_MAX_SOURCES = max(1, env_int("SUBTITLE_DISCOVERY_MAX_SOURCES", 20))
-DISCOVERY_DEFAULT_MAX_PER_SOURCE = max(1, env_int("SUBTITLE_DISCOVERY_MAX_PER_SOURCE", 120))
+DISCOVERY_DEFAULT_MAX_PER_SOURCE = max(1, env_int("SUBTITLE_DISCOVERY_MAX_PER_SOURCE", 300))
 DISCOVERY_HARD_MAX_PER_SOURCE = max(
     DISCOVERY_DEFAULT_MAX_PER_SOURCE,
     env_int("SUBTITLE_DISCOVERY_HARD_MAX_PER_SOURCE", 1000),
 )
-DISCOVERY_DEFAULT_DETAIL_LOOKUP_LIMIT = max(0, env_int("SUBTITLE_DISCOVERY_DETAIL_LOOKUP_LIMIT", 120))
+DISCOVERY_DEFAULT_DETAIL_LOOKUP_LIMIT = max(
+    0,
+    env_int("SUBTITLE_DISCOVERY_DETAIL_LOOKUP_LIMIT", DISCOVERY_DEFAULT_MAX_PER_SOURCE),
+)
 DISCOVERY_DETAIL_LOOKUP_HARD_LIMIT = max(
     DISCOVERY_DEFAULT_DETAIL_LOOKUP_LIMIT,
     env_int("SUBTITLE_DISCOVERY_DETAIL_LOOKUP_HARD_LIMIT", 1000),
@@ -120,6 +142,12 @@ DISCOVERY_YTDLP_LIST_TIMEOUT_SECONDS = max(5.0, env_float("SUBTITLE_DISCOVERY_YT
 DISCOVERY_YTDLP_BATCH_SIZE = max(1, min(500, env_int("SUBTITLE_DISCOVERY_YTDLP_BATCH_SIZE", 100)))
 YOUTUBE_DATA_API_KEY = clean_scalar(os.environ.get("YOUTUBE_DATA_API_KEY") or os.environ.get("YOUTUBE_API_KEY"))
 YOUTUBE_API_TIMEOUT_SECONDS = max(3.0, env_float("YOUTUBE_API_TIMEOUT_SECONDS", 20.0))
+YOUTUBE_API_MAX_ATTEMPTS = max(1, env_int("YOUTUBE_API_MAX_ATTEMPTS", 3))
+YOUTUBE_API_RETRY_BASE_SECONDS = max(0.0, env_float("YOUTUBE_API_RETRY_BASE_SECONDS", 2.0))
+DISCOVERY_API_FALLBACK_TO_YTDLP = env_bool("SUBTITLE_DISCOVERY_API_FALLBACK_TO_YTDLP", False)
+DISCOVERY_PROVIDER = normalize_discovery_provider(os.environ.get("SUBTITLE_DISCOVERY_PROVIDER")) or (
+    "youtube_api" if YOUTUBE_DATA_API_KEY else "yt_dlp"
+)
 DISCOVERY_YTDLP_MAX_PER_SOURCE_WITHOUT_API = max(
     1,
     min(
@@ -150,9 +178,11 @@ class Job:
     id: str
     urls: List[str]
     output_dir: Path
+    archive_title: str = ""
     status: str = "queued"
     current: int = 0
     total: int = 0
+    cancel_requested: bool = False
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
@@ -190,6 +220,130 @@ jobs: Dict[str, Job] = {}
 discovery_tasks: Dict[str, DiscoveryTask] = {}
 jobs_lock = threading.Lock()
 discovery_tasks_lock = threading.Lock()
+settings_lock = threading.Lock()
+job_queue: List[str] = []
+job_queue_condition = threading.Condition()
+job_worker_thread: Optional[threading.Thread] = None
+
+
+TERMINAL_JOB_STATUSES = {"completed", "completed_with_errors", "failed", "cancelled"}
+
+
+class JobCancelled(Exception):
+    pass
+
+
+def mask_secret(value: str) -> str:
+    value = clean_scalar(value)
+    if not value:
+        return ""
+    if len(value) <= 10:
+        return "•" * len(value)
+    return f"{value[:6]}{'•' * 8}{value[-4:]}"
+
+
+def reload_runtime_settings_from_env() -> None:
+    global DISCOVERY_DEFAULT_MAX_PER_SOURCE
+    global DISCOVERY_DEFAULT_DETAIL_LOOKUP_LIMIT
+    global YOUTUBE_DATA_API_KEY
+    global YOUTUBE_API_TIMEOUT_SECONDS
+    global YOUTUBE_API_MAX_ATTEMPTS
+    global YOUTUBE_API_RETRY_BASE_SECONDS
+    global DISCOVERY_API_FALLBACK_TO_YTDLP
+    global DISCOVERY_PROVIDER
+
+    DISCOVERY_DEFAULT_MAX_PER_SOURCE = max(1, env_int("SUBTITLE_DISCOVERY_MAX_PER_SOURCE", 300))
+    DISCOVERY_DEFAULT_DETAIL_LOOKUP_LIMIT = max(0, env_int("SUBTITLE_DISCOVERY_DETAIL_LOOKUP_LIMIT", DISCOVERY_DEFAULT_MAX_PER_SOURCE))
+    YOUTUBE_DATA_API_KEY = clean_scalar(os.environ.get("YOUTUBE_DATA_API_KEY") or os.environ.get("YOUTUBE_API_KEY"))
+    YOUTUBE_API_TIMEOUT_SECONDS = max(3.0, env_float("YOUTUBE_API_TIMEOUT_SECONDS", 20.0))
+    YOUTUBE_API_MAX_ATTEMPTS = max(1, env_int("YOUTUBE_API_MAX_ATTEMPTS", 3))
+    YOUTUBE_API_RETRY_BASE_SECONDS = max(0.0, env_float("YOUTUBE_API_RETRY_BASE_SECONDS", 2.0))
+    DISCOVERY_API_FALLBACK_TO_YTDLP = env_bool("SUBTITLE_DISCOVERY_API_FALLBACK_TO_YTDLP", False)
+    DISCOVERY_PROVIDER = normalize_discovery_provider(os.environ.get("SUBTITLE_DISCOVERY_PROVIDER")) or (
+        "youtube_api" if YOUTUBE_DATA_API_KEY else "yt_dlp"
+    )
+
+
+def write_env_values(updates: Dict[str, str]) -> None:
+    existing = []
+    if ENV_PATH.exists():
+        existing = ENV_PATH.read_text(encoding="utf-8").splitlines()
+
+    remaining = {key: str(value) for key, value in updates.items()}
+    lines = []
+    for line in existing:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            lines.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in remaining:
+            lines.append(f"{key}={remaining.pop(key)}")
+        else:
+            lines.append(line)
+
+    for key, value in remaining.items():
+        lines.append(f"{key}={value}")
+
+    ENV_PATH.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def settings_payload() -> Dict[str, object]:
+    return {
+        "youtube_api_key_configured": bool(YOUTUBE_DATA_API_KEY),
+        "youtube_api_key_masked": mask_secret(YOUTUBE_DATA_API_KEY),
+        "discovery_provider": DISCOVERY_PROVIDER,
+        "discovery_check_limit": DISCOVERY_DEFAULT_MAX_PER_SOURCE,
+        "api_fallback_to_ytdlp": DISCOVERY_API_FALLBACK_TO_YTDLP,
+        "youtube_api_timeout_seconds": YOUTUBE_API_TIMEOUT_SECONDS,
+        "youtube_api_max_attempts": YOUTUBE_API_MAX_ATTEMPTS,
+        "youtube_api_retry_base_seconds": YOUTUBE_API_RETRY_BASE_SECONDS,
+    }
+
+
+def update_settings_from_payload(payload: Dict[str, object]) -> Dict[str, object]:
+    updates: Dict[str, str] = {}
+
+    if "youtube_api_key" in payload:
+        api_key = clean_scalar(payload.get("youtube_api_key") or "")
+        if api_key and "•" not in api_key:
+            updates["YOUTUBE_DATA_API_KEY"] = api_key
+        elif payload.get("clear_youtube_api_key"):
+            updates["YOUTUBE_DATA_API_KEY"] = ""
+
+    if "discovery_provider" in payload:
+        provider = normalize_discovery_provider(payload.get("discovery_provider"))
+        if not provider:
+            raise ValueError("发现方式只能选择 YouTube API 或 yt-dlp。")
+        updates["SUBTITLE_DISCOVERY_PROVIDER"] = provider
+
+    if "api_fallback_to_ytdlp" in payload:
+        updates["SUBTITLE_DISCOVERY_API_FALLBACK_TO_YTDLP"] = "1" if payload.get("api_fallback_to_ytdlp") else "0"
+
+    if "discovery_check_limit" in payload:
+        limit = max(1, min(DISCOVERY_HARD_MAX_PER_SOURCE, int(payload.get("discovery_check_limit") or 120)))
+        updates["SUBTITLE_DISCOVERY_MAX_PER_SOURCE"] = str(limit)
+        updates["SUBTITLE_DISCOVERY_DETAIL_LOOKUP_LIMIT"] = str(limit)
+
+    if "youtube_api_timeout_seconds" in payload:
+        timeout = max(3.0, float(payload.get("youtube_api_timeout_seconds") or 20.0))
+        updates["YOUTUBE_API_TIMEOUT_SECONDS"] = str(round(timeout, 3))
+
+    if "youtube_api_max_attempts" in payload:
+        attempts = max(1, int(payload.get("youtube_api_max_attempts") or 3))
+        updates["YOUTUBE_API_MAX_ATTEMPTS"] = str(attempts)
+
+    if "youtube_api_retry_base_seconds" in payload:
+        retry_base = max(0.0, float(payload.get("youtube_api_retry_base_seconds") or 2.0))
+        updates["YOUTUBE_API_RETRY_BASE_SECONDS"] = str(round(retry_base, 3))
+
+    with settings_lock:
+        if updates:
+            write_env_values(updates)
+            for key, value in updates.items():
+                os.environ[key] = value
+            reload_runtime_settings_from_env()
+        return settings_payload()
 cache_lock = threading.Lock()
 channels_lock = threading.Lock()
 url_cache: Dict[str, Dict[str, object]] = {}
@@ -417,19 +571,34 @@ def youtube_api_get(endpoint: str, params: Dict[str, object]) -> Dict[str, objec
         raise ValueError("YOUTUBE_DATA_API_KEY is not configured.")
     query = dict(params)
     query["key"] = YOUTUBE_DATA_API_KEY
-    response = requests.get(
-        f"https://www.googleapis.com/youtube/v3/{endpoint}",
-        params=query,
-        timeout=YOUTUBE_API_TIMEOUT_SECONDS,
-    )
-    if response.status_code >= 400:
+    url = f"https://www.googleapis.com/youtube/v3/{endpoint}"
+    last_error = ""
+    for attempt in range(1, YOUTUBE_API_MAX_ATTEMPTS + 1):
         try:
-            payload = response.json()
-            message = clean_scalar((payload.get("error") or {}).get("message") or response.text)
-        except Exception:
-            message = clean_scalar(response.text)
-        raise ValueError(f"YouTube API {endpoint} failed: HTTP {response.status_code} {message}")
-    return response.json()
+            response = requests.get(
+                url,
+                params=query,
+                timeout=YOUTUBE_API_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as error:
+            last_error = f"YouTube API {endpoint} request failed: {error}"
+            retryable = True
+        else:
+            if response.status_code < 400:
+                return response.json()
+            try:
+                payload = response.json()
+                message = clean_scalar((payload.get("error") or {}).get("message") or response.text)
+            except Exception:
+                message = clean_scalar(response.text)
+            last_error = f"YouTube API {endpoint} failed: HTTP {response.status_code} {message}"
+            retryable = response.status_code in {408, 429, 500, 502, 503, 504}
+
+        if not retryable or attempt >= YOUTUBE_API_MAX_ATTEMPTS:
+            raise ValueError(last_error)
+        delay = YOUTUBE_API_RETRY_BASE_SECONDS * attempt + random.uniform(0, 0.5)
+        time.sleep(delay)
+    raise ValueError(last_error or f"YouTube API {endpoint} failed")
 
 
 def youtube_channel_lookup_params(source_url: str) -> Dict[str, object]:
@@ -789,7 +958,7 @@ def discover_source_videos(
             "title": entry["title"],
             "provider": "yt_dlp",
             "scanned_count": 1,
-            "included_count": len([entry] if not publish_date or publish_date >= cutoff_date else []),
+            "included_count": 1 if publish_date and publish_date >= cutoff_date else 0,
             "unknown_date_count": 0 if publish_date else 1,
             "out_of_range_count": 0 if not publish_date or publish_date >= cutoff_date else 1,
             "detail_lookup_count": 1 if detail_lookup_limit > 0 else 0,
@@ -797,11 +966,13 @@ def discover_source_videos(
             "detail_lookup_error_count": 1 if detail.get("error") else 0,
             "detail_lookup_limit_reached": False,
             "limit_reached": False,
-            "items": [entry] if not publish_date or publish_date >= cutoff_date else [],
+            "items": [entry] if publish_date and publish_date >= cutoff_date else [],
         }
 
     api_error = ""
-    if YOUTUBE_DATA_API_KEY and is_youtube_url(listing_url):
+    if DISCOVERY_PROVIDER == "youtube_api" and is_youtube_url(listing_url):
+        if not YOUTUBE_DATA_API_KEY:
+            raise RuntimeError("已选择 YouTube API 发现方式，请先在右上角设置里填写 YOUTUBE_DATA_API_KEY。")
         try:
             return youtube_api_discover_source_videos(
                 source_url,
@@ -813,6 +984,10 @@ def discover_source_videos(
             )
         except Exception as error:
             api_error = str(error)
+            if not DISCOVERY_API_FALLBACK_TO_YTDLP:
+                raise RuntimeError(
+                    f"YouTube API 查询失败，未降级到 yt-dlp 以避免结果不一致：{api_error}"
+                ) from error
 
     requested_max_per_source = max_per_source
     yt_dlp_max_per_source = min(max_per_source, DISCOVERY_YTDLP_MAX_PER_SOURCE_WITHOUT_API)
@@ -1055,8 +1230,12 @@ def discover_videos(
                         "source_index": source_index,
                         "source_count": source_count,
                         "error": str(error),
-                    }
-                )
+                }
+            )
+
+    if source_results and all(source.get("error") for source in source_results):
+        first_error = clean_scalar(source_results[0].get("error") or "未知错误")
+        raise RuntimeError(f"所有频道扫描失败：{first_error}")
 
     all_items.sort(key=lambda item: item.get("publish_date") or "0000-00-00", reverse=True)
     provider_counts = {}
@@ -1742,6 +1921,33 @@ def refresh_discovery_record(record_id: str) -> Dict[str, object]:
     return record
 
 
+def safe_download_name_part(value: str) -> str:
+    value = clean_scalar(value)
+    value = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", value)
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    return value[:100].strip(" .")
+
+
+def zip_download_filename(job: Job) -> str:
+    title = safe_download_name_part(job.archive_title)
+    if not title:
+        return f"subtitles_{job.id}.zip"
+    timestamp = datetime.fromtimestamp(job.created_at).strftime("%Y%m%d_%H%M")
+    return f"{title}_{timestamp}.zip"
+
+
+def ascii_download_fallback(filename: str) -> str:
+    fallback = re.sub(r"[^A-Za-z0-9._-]+", "_", filename)
+    fallback = re.sub(r"_+", "_", fallback).strip("._")
+    return fallback or "subtitles.zip"
+
+
+def attachment_content_disposition(filename: str) -> str:
+    fallback = ascii_download_fallback(filename).replace('"', "_")
+    encoded = quote(filename, safe="")
+    return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{encoded}'
+
+
 def job_to_dict(job: Job) -> Dict:
     files = sorted(job.files, key=lambda file: file.filename)
     elapsed_values = [file.elapsed_seconds for file in files]
@@ -1762,9 +1968,13 @@ def job_to_dict(job: Job) -> Dict:
 
     return {
         "id": job.id,
+        "archive_title": job.archive_title,
+        "download_filename": zip_download_filename(job),
         "status": job.status,
         "current": job.current,
         "total": job.total,
+        "cancel_requested": job.cancel_requested,
+        "queue_position": job_queue_position(job.id),
         "created_at": job.created_at,
         "updated_at": job.updated_at,
         "started_at": job.started_at,
@@ -1810,6 +2020,101 @@ def update_job(job_id: str, **changes) -> None:
     persist_job_summary(job)
 
 
+def job_queue_position(job_id: str) -> int:
+    with job_queue_condition:
+        try:
+            return job_queue.index(job_id) + 1
+        except ValueError:
+            return 0
+
+
+def remove_queued_job(job_id: str) -> bool:
+    with job_queue_condition:
+        before = len(job_queue)
+        job_queue[:] = [queued_id for queued_id in job_queue if queued_id != job_id]
+        return len(job_queue) != before
+
+
+def enqueue_job(job_id: str) -> None:
+    with job_queue_condition:
+        if job_id not in job_queue:
+            job_queue.append(job_id)
+        job_queue_condition.notify()
+    ensure_job_worker()
+
+
+def ensure_job_worker() -> None:
+    global job_worker_thread
+    with job_queue_condition:
+        if job_worker_thread and job_worker_thread.is_alive():
+            return
+        job_worker_thread = threading.Thread(target=job_worker_loop, daemon=True)
+        job_worker_thread.start()
+
+
+def job_worker_loop() -> None:
+    while True:
+        with job_queue_condition:
+            while not job_queue:
+                job_queue_condition.wait()
+            job_id = job_queue.pop(0)
+
+        with jobs_lock:
+            job = jobs.get(job_id)
+            should_run = bool(job and job.status == "queued" and not job.cancel_requested)
+        if not should_run:
+            continue
+
+        try:
+            process_job(job_id)
+        except Exception as error:
+            traceback.print_exc()
+            with jobs_lock:
+                job = jobs.get(job_id)
+                if not job:
+                    continue
+                job.status = "failed"
+                job.message = str(error)
+                job.cooldown_until = None
+                job.completed_at = time.time()
+                job.updated_at = time.time()
+                failed_job = job
+            write_job_artifacts(failed_job)
+
+
+def is_job_cancel_requested(job_id: str) -> bool:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        return bool(job and job.cancel_requested)
+
+
+def request_job_stop(job_id: str) -> Job:
+    remove_from_queue = False
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise ValueError("Job not found.")
+        if job.status in TERMINAL_JOB_STATUSES:
+            return job
+        job.cancel_requested = True
+        job.cooldown_until = None
+        if job.status == "queued":
+            remove_from_queue = True
+            message = "已停止，任务尚未开始。"
+        else:
+            message = "已停止，当前未完成视频已忽略。"
+        job.status = "cancelled"
+        job.message = message
+        job.completed_at = time.time()
+        job.updated_at = time.time()
+        stopped_job = job
+
+    if remove_from_queue:
+        remove_queued_job(job_id)
+    write_job_artifacts(stopped_job)
+    return stopped_job
+
+
 def format_duration(seconds: float) -> str:
     seconds = max(0, int(round(seconds)))
     if seconds < 60:
@@ -1838,16 +2143,26 @@ def clear_job_notice(job_id: str) -> None:
     set_job_notice(job_id, "", None)
 
 
+def sleep_with_cancel(job_id: str, seconds: float) -> None:
+    deadline = time.monotonic() + max(0, seconds)
+    while True:
+        if is_job_cancel_requested(job_id):
+            raise JobCancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1.0, remaining))
+
+
 def pause_job(job_id: str, message: str, seconds: float) -> None:
     if seconds <= 0:
         return
     set_job_notice(job_id, message, time.time() + seconds)
-    deadline = time.monotonic() + seconds
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(5, remaining))
+    try:
+        sleep_with_cancel(job_id, seconds)
+    except JobCancelled:
+        set_job_notice(job_id, "正在停止，当前任务将结束。", None)
+        raise
     clear_job_notice(job_id)
 
 
@@ -1855,6 +2170,8 @@ def add_file(job_id: str, file: JobFile) -> None:
     job = None
     with jobs_lock:
         job = jobs[job_id]
+        if job.status in TERMINAL_JOB_STATUSES or job.cancel_requested:
+            return
         job.files.append(file)
         job.updated_at = time.time()
     register_cache_entry(job, file)
@@ -1865,6 +2182,8 @@ def add_error_record(job_id: str, error: Dict[str, object]) -> None:
     job = None
     with jobs_lock:
         job = jobs[job_id]
+        if job.status in TERMINAL_JOB_STATUSES or job.cancel_requested:
+            return
         job.errors.append(error)
         job.updated_at = time.time()
     persist_job_summary(job)
@@ -2013,9 +2332,11 @@ def job_from_manifest(path: Path) -> Optional[Job]:
         id=job_id,
         urls=list(data.get("urls") or []),
         output_dir=path.parent,
+        archive_title=clean_scalar(data.get("archive_title") or ""),
         status=status,
         current=int(data.get("current") or len(files) + len(errors)),
         total=int(data.get("total") or len(files) + len(errors)),
+        cancel_requested=bool(data.get("cancel_requested", False)) if status not in TERMINAL_JOB_STATUSES else False,
         created_at=float(data.get("created_at") or path.stat().st_mtime),
         updated_at=float(data.get("updated_at") or path.stat().st_mtime),
         started_at=data.get("started_at"),
@@ -2070,9 +2391,9 @@ def process_url(url: str, index: int, output_dir: Path, retry_counter: List[int]
     )
 
 
-def task_retry_sleep(attempt: int) -> None:
+def task_retry_sleep(job_id: str, attempt: int) -> None:
     delay = min(TASK_RETRY_MAX_SECONDS, TASK_RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
-    time.sleep(delay + random.uniform(0, TASK_RETRY_JITTER_SECONDS))
+    sleep_with_cancel(job_id, delay + random.uniform(0, TASK_RETRY_JITTER_SECONDS))
 
 
 def rewrite_article_id(markdown: str, index: int) -> str:
@@ -2123,22 +2444,84 @@ def process_cached_url(url: str, index: int, output_dir: Path) -> Optional[JobFi
     )
 
 
+def run_process_url_cancellable(
+    job_id: str,
+    url: str,
+    index: int,
+    output_dir: Path,
+    retry_counter: List[int],
+) -> JobFile:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix=f".{job_id}_{index:03d}_", dir=str(output_dir)))
+    result_queue: Queue = Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            result_queue.put((process_url(url, index, temp_dir, retry_counter), None))
+        except BaseException as error:
+            result_queue.put((None, error))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    while True:
+        if is_job_cancel_requested(job_id):
+            thread.join()
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise JobCancelled()
+        try:
+            file, error = result_queue.get(timeout=0.5)
+            break
+        except Empty:
+            continue
+
+    if error:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        if isinstance(error, JobCancelled):
+            raise error
+        raise error
+    if is_job_cancel_requested(job_id):
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise JobCancelled()
+
+    source_path = temp_dir / file.filename
+    target_path = output_dir / file.filename
+    if source_path.exists():
+        shutil.move(str(source_path), str(target_path))
+        file.size_bytes = target_path.stat().st_size
+    if is_job_cancel_requested(job_id):
+        target_path.unlink(missing_ok=True)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise JobCancelled()
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    return file
+
+
 def process_url_with_retry(job_id: str, url: str, index: int, output_dir: Path):
+    if is_job_cancel_requested(job_id):
+        raise JobCancelled()
     item_start = time.monotonic()
     cached_file = process_cached_url(url, index, output_dir)
     if cached_file:
+        if is_job_cancel_requested(job_id):
+            (output_dir / cached_file.filename).unlink(missing_ok=True)
+            raise JobCancelled()
         cached_file.elapsed_seconds = round(time.monotonic() - item_start, 3)
         return cached_file, None, False
 
     retry_counter = [0]
     for attempt in range(1, TASK_MAX_ATTEMPTS + 1):
+        if is_job_cancel_requested(job_id):
+            raise JobCancelled()
         attempt_start = time.monotonic()
         try:
-            file = process_url(url, index, output_dir, retry_counter)
+            file = run_process_url_cancellable(job_id, url, index, output_dir, retry_counter)
             file.elapsed_seconds = round(time.monotonic() - item_start, 3)
             file.retry_count = retry_counter[0]
             return file, None, rate_limit_detected_since(attempt_start)
         except Exception as error:
+            if isinstance(error, JobCancelled):
+                raise
             was_rate_limited = looks_rate_limited_error(error) or rate_limit_detected_since(attempt_start)
             if attempt >= TASK_MAX_ATTEMPTS:
                 return None, {
@@ -2148,6 +2531,8 @@ def process_url_with_retry(job_id: str, url: str, index: int, output_dir: Path):
                     "retry_count": retry_counter[0],
                 }, was_rate_limited
             retry_counter[0] += 1
+            if is_job_cancel_requested(job_id):
+                raise JobCancelled()
             if was_rate_limited:
                 pause_job(
                     job_id,
@@ -2155,25 +2540,45 @@ def process_url_with_retry(job_id: str, url: str, index: int, output_dir: Path):
                     IP_BLOCK_COOLDOWN_SECONDS,
                 )
             else:
-                task_retry_sleep(attempt)
+                task_retry_sleep(job_id, attempt)
 
 
 def process_job(job_id: str) -> None:
     with jobs_lock:
-        job = jobs[job_id]
-        urls = list(job.urls)
-        output_dir = job.output_dir
-        job.status = "running"
-        job.total = len(urls)
-        job.started_at = time.time()
-        job.updated_at = time.time()
-        started_job = job
+        job = jobs.get(job_id)
+        if not job:
+            return
+        if job.cancel_requested or job.status == "cancelled":
+            job.status = "cancelled"
+            job.message = "已停止，任务尚未开始。"
+            job.completed_at = time.time()
+            job.updated_at = time.time()
+            cancelled_job = job
+            write_job = True
+        elif job.status != "queued":
+            return
+        else:
+            urls = list(job.urls)
+            output_dir = job.output_dir
+            job.status = "running"
+            job.total = len(urls)
+            job.started_at = time.time()
+            job.updated_at = time.time()
+            started_job = job
+            write_job = False
+    if write_job:
+        write_job_artifacts(cancelled_job)
+        return
     persist_job_summary(started_job)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     processed_since_pause = 0
+    cancelled = False
     for index, url in enumerate(urls, start=1):
+        if is_job_cancel_requested(job_id):
+            cancelled = True
+            break
         file = None
         error_record = None
         was_rate_limited = False
@@ -2183,6 +2588,9 @@ def process_job(job_id: str) -> None:
                 add_file(job_id, file)
             elif error_record:
                 add_error_record(job_id, error_record)
+        except JobCancelled:
+            cancelled = True
+            break
         except Exception as error:
             error_record = {
                 "url": url,
@@ -2201,16 +2609,24 @@ def process_job(job_id: str) -> None:
             progress_job = job
         persist_job_summary(progress_job)
 
+        if is_job_cancel_requested(job_id):
+            cancelled = True
+            break
+
         if index >= len(urls):
             continue
 
         if was_rate_limited:
             processed_since_pause = 0
-            pause_job(
-                job_id,
-                f"检测到 YouTube 限流，自动冷却 {format_duration(IP_BLOCK_COOLDOWN_SECONDS)} 后继续。",
-                IP_BLOCK_COOLDOWN_SECONDS,
-            )
+            try:
+                pause_job(
+                    job_id,
+                    f"检测到 YouTube 限流，自动冷却 {format_duration(IP_BLOCK_COOLDOWN_SECONDS)} 后继续。",
+                    IP_BLOCK_COOLDOWN_SECONDS,
+                )
+            except JobCancelled:
+                cancelled = True
+                break
             continue
 
         used_network = not (file and file.from_cache)
@@ -2219,18 +2635,27 @@ def process_job(job_id: str) -> None:
 
         if AUTO_BATCH_SIZE and processed_since_pause >= AUTO_BATCH_SIZE:
             processed_since_pause = 0
-            pause_job(
-                job_id,
-                f"已处理 {AUTO_BATCH_SIZE} 条，自动休息 {format_duration(AUTO_BATCH_COOLDOWN_SECONDS)} 后继续。",
-                AUTO_BATCH_COOLDOWN_SECONDS,
-            )
+            try:
+                pause_job(
+                    job_id,
+                    f"已处理 {AUTO_BATCH_SIZE} 条，自动休息 {format_duration(AUTO_BATCH_COOLDOWN_SECONDS)} 后继续。",
+                    AUTO_BATCH_COOLDOWN_SECONDS,
+                )
+            except JobCancelled:
+                cancelled = True
+                break
 
     with jobs_lock:
         job = jobs[job_id]
-        job.status = "completed_with_errors" if job.errors else "completed"
-        job.current = job.total
+        if cancelled or job.cancel_requested:
+            job.status = "cancelled"
+            job.cancel_requested = True
+            job.message = "已停止，当前未完成视频已忽略。"
+        else:
+            job.status = "completed_with_errors" if job.errors else "completed"
+            job.current = job.total
+            job.message = ""
         job.completed_at = time.time()
-        job.message = ""
         job.cooldown_until = None
         job.updated_at = time.time()
         final_job = job
@@ -2254,6 +2679,8 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.serve_static(path.removeprefix("/static/"))
         if path == "/api/jobs":
             return self.handle_jobs_list()
+        if path == "/api/settings":
+            return self.handle_settings_get()
         if path == "/api/channels":
             return self.handle_channels_list()
         if path.startswith("/api/channels/"):
@@ -2273,6 +2700,10 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/jobs":
             return self.handle_create_job()
+        if parsed.path.startswith("/api/jobs/"):
+            return self.handle_job_post(parsed.path)
+        if parsed.path == "/api/settings":
+            return self.handle_settings_post()
         if parsed.path == "/api/channels":
             return self.handle_add_channels()
         if parsed.path.startswith("/api/channels/"):
@@ -2306,6 +2737,7 @@ class AppHandler(BaseHTTPRequestHandler):
         try:
             payload = self.read_json_body()
             raw_urls = payload.get("urls", "")
+            archive_title = safe_download_name_part(clean_scalar(payload.get("archive_title") or ""))
             if isinstance(raw_urls, list):
                 raw_urls = "\n".join(str(item) for item in raw_urls)
             urls = parse_urls(str(raw_urls))
@@ -2316,14 +2748,35 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
 
         job_id = uuid.uuid4().hex[:12]
-        job = Job(id=job_id, urls=urls, output_dir=OUTPUT_DIR / job_id, total=len(urls))
+        job = Job(id=job_id, urls=urls, output_dir=OUTPUT_DIR / job_id, archive_title=archive_title, total=len(urls))
         with jobs_lock:
             jobs[job_id] = job
         persist_job_summary(job)
-
-        thread = threading.Thread(target=process_job, args=(job_id,), daemon=True)
-        thread.start()
+        enqueue_job(job_id)
         return self.send_json(job_to_dict(job), HTTPStatus.CREATED)
+
+    def handle_job_post(self, path: str):
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 4 and parts[3] in {"stop", "cancel"}:
+            try:
+                job = request_job_stop(parts[2])
+                return self.send_json(job_to_dict(job))
+            except ValueError as error:
+                return self.send_json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+            except Exception as error:
+                return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        return self.send_error(HTTPStatus.NOT_FOUND)
+
+    def handle_settings_get(self):
+        return self.send_json(settings_payload())
+
+    def handle_settings_post(self):
+        try:
+            payload = self.read_json_body()
+            result = update_settings_from_payload(payload)
+        except Exception as error:
+            return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        return self.send_json(result)
 
     def handle_channels_list(self):
         return self.send_json({"channels": list_followed_channels()})
@@ -2476,9 +2929,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 "jobs": [
                     {
                         "id": job.id,
+                        "archive_title": job.archive_title,
+                        "download_filename": zip_download_filename(job),
                         "status": job.status,
                         "current": job.current,
                         "total": job.total,
+                        "cancel_requested": job.cancel_requested,
+                        "queue_position": job_queue_position(job.id),
                         "updated_at": job.updated_at,
                         "summary": job_to_dict(job)["summary"],
                     }
@@ -2540,7 +2997,7 @@ class AppHandler(BaseHTTPRequestHandler):
         data = zip_path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/zip")
-        self.send_header("Content-Disposition", f'attachment; filename="subtitles_{job.id}.zip"')
+        self.send_header("Content-Disposition", attachment_content_disposition(zip_download_filename(job)))
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         if not self.head_only:

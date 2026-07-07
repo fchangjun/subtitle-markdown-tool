@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>视频字幕转 Markdown</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260703-source-progress" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260707-job-queue" />
   </head>
   <body>
     <header class="topbar">
@@ -16,11 +16,78 @@
         <button class="tab-button active" id="searchTab" type="button" data-page="search">查找</button>
         <button class="tab-button" id="extractTab" type="button" data-page="extract">导入下载</button>
       </nav>
-      <div class="server-state" id="serverState">
-        <span class="dot"></span>
-        <span>就绪</span>
+      <div class="topbar-actions">
+        <div class="server-state" id="serverState">
+          <span class="dot"></span>
+          <span>就绪</span>
+        </div>
+        <button class="secondary settings-toggle" id="settingsToggleButton" type="button" aria-label="打开设置">
+          <span class="button-icon">⚙</span>
+          <span>设置</span>
+        </button>
       </div>
     </header>
+
+    <div class="settings-backdrop" id="settingsBackdrop" hidden></div>
+    <aside class="settings-panel" id="settingsPanel" aria-label="设置面板" hidden>
+      <div class="settings-panel-head">
+        <div>
+          <h2>发现设置</h2>
+          <p id="settingsProviderState">读取配置中</p>
+        </div>
+        <button class="secondary small icon-only" id="settingsCloseButton" type="button" aria-label="关闭设置">×</button>
+      </div>
+
+      <label class="settings-field">
+        <span>发现方式</span>
+        <select id="discoveryProviderSetting">
+          <option value="youtube_api">YouTube API（精确）</option>
+          <option value="yt_dlp">yt-dlp（估算）</option>
+        </select>
+      </label>
+
+      <label class="settings-field">
+        <span>YouTube API Key</span>
+        <input id="youtubeApiKeyInput" type="password" autocomplete="off" placeholder="AIza..." />
+      </label>
+      <div class="settings-key-state" id="youtubeApiKeyState">未配置</div>
+
+      <div class="settings-grid">
+        <label class="settings-field">
+          <span>每频道检查上限</span>
+          <select id="discoveryCheckLimitInput">
+            <option value="50">50 条</option>
+            <option value="120">120 条</option>
+            <option value="300" selected>300 条</option>
+            <option value="500">500 条</option>
+            <option value="1000">1000 条</option>
+          </select>
+        </label>
+        <label class="settings-field">
+          <span>API 超时秒数</span>
+          <input id="youtubeApiTimeoutInput" type="number" min="3" step="1" />
+        </label>
+      </div>
+
+      <div class="settings-grid">
+        <label class="settings-field">
+          <span>API 重试次数</span>
+          <input id="youtubeApiAttemptsInput" type="number" min="1" step="1" />
+        </label>
+      </div>
+
+      <label class="settings-check">
+        <input id="apiFallbackInput" type="checkbox" />
+        <span>API 失败时允许使用 yt-dlp 估算</span>
+      </label>
+
+      <div class="settings-message" id="settingsMessage"></div>
+
+      <div class="settings-actions">
+        <button class="primary small" id="saveSettingsButton" type="button">保存</button>
+        <button class="secondary small" id="cancelSettingsButton" type="button">取消</button>
+      </div>
+    </aside>
 
     <main>
       <section class="page active" id="searchPage" aria-labelledby="searchTitle">
@@ -42,6 +109,9 @@
               <textarea id="followInput" class="follow-textarea" spellcheck="false" placeholder="新增关注频道，一行一个主页链接"></textarea>
               <div class="actions compact-actions">
                 <button class="secondary small" id="addChannelsButton" type="button">添加关注</button>
+                <button class="secondary small" id="selectAllChannelsButton" type="button">全选</button>
+                <button class="secondary small" id="invertChannelsButton" type="button">反选</button>
+                <button class="secondary small" id="refreshSelectedChannelsButton" type="button" disabled>更新选中</button>
                 <button class="secondary small" id="refreshChannelButton" type="button" disabled>更新频道</button>
               </div>
               <div class="channel-list" id="channelList">
@@ -63,31 +133,6 @@
                   <option value="5年">最近 5 年</option>
                 </select>
               </label>
-              <label>
-                <span>每频道上限</span>
-                <select id="maxPerSourceInput">
-                  <option value="20">20 条</option>
-                  <option value="50">50 条</option>
-                  <option value="120" selected>120 条</option>
-                  <option value="300">300 条</option>
-                  <option value="500">500 条</option>
-                  <option value="1000">1000 条</option>
-                </select>
-              </label>
-              <label>
-                <span>每频道补日期</span>
-                <select id="detailLookupLimitInput">
-                  <option value="0">不补</option>
-                  <option value="50">50 条</option>
-                  <option value="120" selected>120 条</option>
-                  <option value="300">300 条</option>
-                  <option value="1000">1000 条</option>
-                </select>
-              </label>
-            </div>
-
-            <div class="actions">
-              <button class="primary" id="discoverButton" type="button">查找勾选频道</button>
             </div>
 
             <div class="discovery-progress progress-block" id="discoveryProgress" hidden>
@@ -211,7 +256,10 @@ https://www.youtube.com/watch?v=f6SIJDGGjuY</textarea>
                 <h2 id="resultsTitle">结果</h2>
                 <p id="jobLabel">尚未创建任务</p>
               </div>
-              <a class="download-all disabled" id="downloadAll" href="#" aria-disabled="true">下载 ZIP</a>
+              <div class="section-actions">
+                <button class="secondary danger small" id="stopJobButton" type="button" hidden>停止任务</button>
+                <a class="download-all disabled" id="downloadAll" href="#" aria-disabled="true">下载 ZIP</a>
+              </div>
             </div>
 
             <div class="result-list" id="resultList">
@@ -228,6 +276,6 @@ https://www.youtube.com/watch?v=f6SIJDGGjuY</textarea>
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260703-source-progress"></script>
+    <script src="/static/app.js?v=20260707-job-queue"></script>
   </body>
 </html>

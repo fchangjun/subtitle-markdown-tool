@@ -1,5 +1,6 @@
 const urlInput = document.querySelector("#urlInput");
 const runButton = document.querySelector("#runButton");
+const runButtonText = document.querySelector("#runButton span:last-child");
 const clearButton = document.querySelector("#clearButton");
 const progressLabel = document.querySelector("#progressLabel");
 const progressCount = document.querySelector("#progressCount");
@@ -10,13 +11,12 @@ const resultList = document.querySelector("#resultList");
 const preview = document.querySelector("#preview");
 const jobLabel = document.querySelector("#jobLabel");
 const downloadAll = document.querySelector("#downloadAll");
+const stopJobButton = document.querySelector("#stopJobButton");
 const openPreview = document.querySelector("#openPreview");
 const serverState = document.querySelector("#serverState span:last-child");
 const historyList = document.querySelector("#historyList");
 const refreshHistoryButton = document.querySelector("#refreshHistoryButton");
 const rangeInput = document.querySelector("#rangeInput");
-const maxPerSourceInput = document.querySelector("#maxPerSourceInput");
-const discoverButton = document.querySelector("#discoverButton");
 const refreshDiscoveryHistory = document.querySelector("#refreshDiscoveryHistory");
 const discoverySummary = document.querySelector("#discoverySummary");
 const activeDiscoveryLabel = document.querySelector("#activeDiscoveryLabel");
@@ -34,14 +34,31 @@ const discoverySourceProgress = document.querySelector("#discoverySourceProgress
 const selectAllDiscovery = document.querySelector("#selectAllDiscovery");
 const clearDiscoverySelection = document.querySelector("#clearDiscoverySelection");
 const importDiscovery = document.querySelector("#importDiscovery");
-const detailLookupLimitInput = document.querySelector("#detailLookupLimitInput");
 const followInput = document.querySelector("#followInput");
 const addChannelsButton = document.querySelector("#addChannelsButton");
+const selectAllChannelsButton = document.querySelector("#selectAllChannelsButton");
+const invertChannelsButton = document.querySelector("#invertChannelsButton");
+const refreshSelectedChannelsButton = document.querySelector("#refreshSelectedChannelsButton");
 const refreshChannels = document.querySelector("#refreshChannels");
 const refreshChannelButton = document.querySelector("#refreshChannelButton");
 const channelList = document.querySelector("#channelList");
 const channelDetail = document.querySelector("#channelDetail");
 const importQueueSummary = document.querySelector("#importQueueSummary");
+const settingsToggleButton = document.querySelector("#settingsToggleButton");
+const settingsPanel = document.querySelector("#settingsPanel");
+const settingsBackdrop = document.querySelector("#settingsBackdrop");
+const settingsCloseButton = document.querySelector("#settingsCloseButton");
+const cancelSettingsButton = document.querySelector("#cancelSettingsButton");
+const saveSettingsButton = document.querySelector("#saveSettingsButton");
+const settingsProviderState = document.querySelector("#settingsProviderState");
+const discoveryProviderSetting = document.querySelector("#discoveryProviderSetting");
+const youtubeApiKeyInput = document.querySelector("#youtubeApiKeyInput");
+const youtubeApiKeyState = document.querySelector("#youtubeApiKeyState");
+const discoveryCheckLimitInput = document.querySelector("#discoveryCheckLimitInput");
+const youtubeApiTimeoutInput = document.querySelector("#youtubeApiTimeoutInput");
+const youtubeApiAttemptsInput = document.querySelector("#youtubeApiAttemptsInput");
+const apiFallbackInput = document.querySelector("#apiFallbackInput");
+const settingsMessage = document.querySelector("#settingsMessage");
 const pageTabs = Array.from(document.querySelectorAll(".tab-button"));
 const pages = {
   search: document.querySelector("#searchPage"),
@@ -59,6 +76,11 @@ let followedChannels = [];
 let activeChannel = null;
 let selectedChannelIds = new Set();
 let channelSelectionInitialized = false;
+let currentSettings = null;
+let discoveryBusy = false;
+let pendingArchiveTitle = "";
+let submittingJob = false;
+let activeJobStatus = "";
 const ACTIVE_JOB_KEY = "subtitleMarkdownTool.activeJobId";
 const RECENT_JOBS_KEY = "subtitleMarkdownTool.recentJobIds";
 const ACTIVE_DISCOVERY_KEY = "subtitleMarkdownTool.activeDiscoveryId";
@@ -70,7 +92,12 @@ const statusText = {
   completed: "已完成",
   completed_with_errors: "部分完成",
   failed: "失败",
+  cancelled: "已停止",
 };
+
+function isTerminalJobStatus(status) {
+  return ["completed", "completed_with_errors", "failed", "cancelled"].includes(status);
+}
 
 function switchPage(pageName) {
   Object.entries(pages).forEach(([name, page]) => {
@@ -97,14 +124,106 @@ function switchContentView(viewName) {
 }
 
 function setBusy(isBusy) {
-  runButton.disabled = isBusy;
   serverState.textContent = isBusy ? "处理中" : "就绪";
+  updateRunButtonState();
+}
+
+function updateRunButtonState() {
+  runButton.disabled = submittingJob;
+  if (submittingJob) {
+    runButtonText.textContent = "添加中";
+  } else if (activeJobStatus && !isTerminalJobStatus(activeJobStatus)) {
+    runButtonText.textContent = "添加到队列";
+  } else {
+    runButtonText.textContent = "开始提取";
+  }
 }
 
 function setMessage(text, type = "info") {
   messages.innerHTML = "";
   if (!text) return;
   appendMessage(text, type);
+}
+
+function discoveryProviderLabel(provider) {
+  if (provider === "youtube_api") return "YouTube API";
+  if (provider === "yt_dlp") return "yt-dlp";
+  return provider || "未设置";
+}
+
+function setSettingsOpen(isOpen) {
+  settingsPanel.hidden = !isOpen;
+  settingsBackdrop.hidden = !isOpen;
+  if (isOpen) {
+    settingsMessage.textContent = "";
+    settingsMessage.className = "settings-message";
+    youtubeApiKeyInput.value = "";
+    loadSettings();
+  }
+}
+
+function renderSettings(settings) {
+  currentSettings = settings;
+  discoveryProviderSetting.value = settings.discovery_provider || "yt_dlp";
+  discoveryCheckLimitInput.value = String(settings.discovery_check_limit || 120);
+  youtubeApiTimeoutInput.value = Math.round(Number(settings.youtube_api_timeout_seconds || 20));
+  youtubeApiAttemptsInput.value = Number(settings.youtube_api_max_attempts || 3);
+  apiFallbackInput.checked = Boolean(settings.api_fallback_to_ytdlp);
+
+  const keyText = settings.youtube_api_key_configured
+    ? `已配置 ${settings.youtube_api_key_masked || ""}`.trim()
+    : "未配置";
+  youtubeApiKeyState.textContent = keyText;
+  youtubeApiKeyInput.placeholder = settings.youtube_api_key_configured ? "留空则保持当前 key" : "AIza...";
+  settingsProviderState.textContent = `${discoveryProviderLabel(settings.discovery_provider)} · ${keyText}`;
+}
+
+async function loadSettings() {
+  try {
+    const response = await fetch("/api/settings");
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    renderSettings(payload);
+    return payload;
+  } catch (error) {
+    settingsProviderState.textContent = "设置读取失败";
+    settingsMessage.textContent = error.message;
+    settingsMessage.className = "settings-message error";
+  }
+}
+
+async function saveSettings() {
+  saveSettingsButton.disabled = true;
+  settingsMessage.textContent = "正在保存";
+  settingsMessage.className = "settings-message";
+  const apiKey = youtubeApiKeyInput.value.trim();
+  const payload = {
+    discovery_provider: discoveryProviderSetting.value,
+    api_fallback_to_ytdlp: apiFallbackInput.checked,
+    discovery_check_limit: Number(discoveryCheckLimitInput.value || 120),
+    youtube_api_timeout_seconds: Number(youtubeApiTimeoutInput.value || 20),
+    youtube_api_max_attempts: Number(youtubeApiAttemptsInput.value || 3),
+  };
+  if (apiKey) payload.youtube_api_key = apiKey;
+
+  try {
+    const response = await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    youtubeApiKeyInput.value = "";
+    renderSettings(result);
+    settingsMessage.textContent = "已保存";
+    settingsMessage.className = "settings-message success";
+  } catch (error) {
+    settingsMessage.textContent = error.message;
+    settingsMessage.className = "settings-message error";
+  } finally {
+    saveSettingsButton.disabled = false;
+  }
 }
 
 function recentJobIds() {
@@ -143,7 +262,12 @@ function updateProgress(job) {
   const current = job.current || 0;
   const pct = total > 0 ? Math.round((current / total) * 100) : 0;
   const coolingDown = cooldownRemaining(job) > 0;
-  progressLabel.textContent = coolingDown ? "自动冷却" : statusText[job.status] || "等待任务";
+  progressLabel.textContent =
+    job.cancel_requested && !isTerminalJobStatus(job.status)
+      ? "停止中"
+      : coolingDown
+      ? "自动冷却"
+      : statusText[job.status] || "等待任务";
   progressCount.textContent = `${current} / ${total}`;
   progressBar.style.width = `${pct}%`;
   const summary = job.summary || {};
@@ -236,7 +360,19 @@ function parseUrlText(text) {
 
 function updateImportQueueSummary() {
   const count = parseUrlText(urlInput.value).length;
-  importQueueSummary.textContent = count ? `待提取 ${count} 个视频` : "待提取队列为空";
+  if (!count) {
+    importQueueSummary.textContent = "待提取队列为空";
+    return;
+  }
+  const sourceText = pendingArchiveTitle ? ` · 来自 ${pendingArchiveTitle}` : "";
+  importQueueSummary.textContent = `待提取 ${count} 个视频${sourceText}`;
+}
+
+function setChannelImportQueue(channel) {
+  const items = channel.items || [];
+  pendingArchiveTitle = channelTitle(channel);
+  urlInput.value = items.map((item) => item.url).join("\n");
+  updateImportQueueSummary();
 }
 
 function renderChannelList(channels) {
@@ -245,6 +381,7 @@ function renderChannelList(channels) {
     channelList.innerHTML = '<div class="history-empty">暂无关注频道</div>';
     selectedChannelIds = new Set();
     channelSelectionInitialized = false;
+    updateChannelSelectionSummary();
     return;
   }
 
@@ -298,7 +435,30 @@ function selectedChannels() {
 
 function updateChannelSelectionSummary() {
   const count = selectedChannels().length;
-  discoverButton.textContent = count ? `查找已选 ${count} 个频道` : "选择频道后查找";
+  const hasChannels = followedChannels.length > 0;
+  selectAllChannelsButton.disabled = discoveryBusy || !hasChannels;
+  invertChannelsButton.disabled = discoveryBusy || !hasChannels;
+  refreshSelectedChannelsButton.disabled = discoveryBusy || !count;
+  refreshChannelButton.disabled = discoveryBusy || !activeChannel;
+  refreshSelectedChannelsButton.textContent = count ? `更新选中 ${count}` : "更新选中";
+  if (discoveryBusy) {
+    refreshSelectedChannelsButton.textContent = "更新中";
+    return;
+  }
+}
+
+function selectAllFollowedChannels() {
+  selectedChannelIds = new Set(followedChannels.map((channel) => channel.id));
+  renderChannelList(followedChannels);
+}
+
+function invertFollowedChannelSelection() {
+  const nextSelection = new Set();
+  followedChannels.forEach((channel) => {
+    if (!selectedChannelIds.has(channel.id)) nextSelection.add(channel.id);
+  });
+  selectedChannelIds = nextSelection;
+  renderChannelList(followedChannels);
 }
 
 function renderChannelDetail(channel) {
@@ -326,6 +486,13 @@ function renderChannelDetail(channel) {
 
   const actions = document.createElement("div");
   actions.className = "channel-detail-actions";
+  const refreshButton = document.createElement("button");
+  refreshButton.className = "file-link";
+  refreshButton.type = "button";
+  refreshButton.textContent = "更新当前频道";
+  refreshButton.addEventListener("click", refreshActiveChannel);
+  actions.appendChild(refreshButton);
+
   const openLink = document.createElement("a");
   openLink.className = "file-link";
   openLink.href = channel.listing_url || channel.source_url || "#";
@@ -339,8 +506,7 @@ function renderChannelDetail(channel) {
     importButton.type = "button";
     importButton.textContent = "导入本频道";
     importButton.addEventListener("click", () => {
-      urlInput.value = channel.items.map((item) => item.url).join("\n");
-      updateImportQueueSummary();
+      setChannelImportQueue(channel);
       switchPage("extract");
     });
     actions.appendChild(importButton);
@@ -359,7 +525,7 @@ function renderChannelDetail(channel) {
   if (!items.length) {
     const empty = document.createElement("div");
     empty.className = "history-empty";
-    empty.textContent = "这个频道还没有内容记录，可以点击左侧“更新频道”。";
+    empty.textContent = "这个频道还没有内容记录，可以点击“更新当前频道”。";
     channelDetail.appendChild(empty);
     return;
   }
@@ -448,8 +614,6 @@ async function refreshActiveChannel() {
     await createDiscoveryTask({
       channel_id: activeChannel.id,
       range: rangeInput.value.trim() || "1年",
-      max_per_source: Number(maxPerSourceInput.value || 120),
-      detail_lookup_limit: Number(detailLookupLimitInput.value || 120),
     });
   } catch (error) {
     channelDetail.innerHTML = `<div class="history-empty">${error.message}</div>`;
@@ -458,10 +622,14 @@ async function refreshActiveChannel() {
 }
 
 function setDiscoveryBusy(isBusy, label = "查找视频") {
-  discoverButton.disabled = isBusy;
+  discoveryBusy = isBusy;
+  const selectedCount = selectedChannels().length;
   refreshChannelButton.disabled = isBusy || !activeChannel;
+  refreshSelectedChannelsButton.disabled = isBusy || !selectedCount;
+  selectAllChannelsButton.disabled = isBusy || !followedChannels.length;
+  invertChannelsButton.disabled = isBusy || !followedChannels.length;
   if (isBusy) {
-    discoverButton.textContent = "扫描中";
+    refreshSelectedChannelsButton.textContent = "更新中";
   } else if (label) {
     updateChannelSelectionSummary();
   }
@@ -523,7 +691,7 @@ function updateDiscoverySelectionSummary() {
     notes.push(`补日期 ${summary.detail_lookup_success_count || 0}/${summary.detail_lookup_count}`);
   }
   if (summary.unknown_date_count) notes.push(`${summary.unknown_date_count} 个日期未知已跳过`);
-  if (summary.detail_lookup_limit_reached_count) notes.push(`${summary.detail_lookup_limit_reached_count} 个频道达到补日期上限`);
+  if (summary.detail_lookup_limit_reached_count) notes.push(`${summary.detail_lookup_limit_reached_count} 个频道达到检查上限`);
   if (summary.detail_lookup_error_count) notes.push(`${summary.detail_lookup_error_count} 个补日期失败`);
   if (summary.limit_reached_count) notes.push(`${summary.limit_reached_count} 个频道达到上限`);
   if (summary.error_count) notes.push(`${summary.error_count} 个频道失败`);
@@ -907,8 +1075,6 @@ async function discoverChannelVideos() {
     await createDiscoveryTask({
       sources,
       range: rangeInput.value.trim() || "1年",
-      max_per_source: Number(maxPerSourceInput.value || 120),
-      detail_lookup_limit: Number(detailLookupLimitInput.value || 120),
     });
   } catch (error) {
     discoverySummary.textContent = "查找失败";
@@ -937,6 +1103,7 @@ function importSelectedDiscoveryUrls() {
     discoverySummary.textContent = "请先选择视频";
     return false;
   }
+  pendingArchiveTitle = "";
   urlInput.value = urls.join("\n");
   updateImportQueueSummary();
   switchPage("extract");
@@ -1072,12 +1239,16 @@ function renderFiles(job) {
 
 function renderJob(job) {
   activeJobId = job.id;
+  activeJobStatus = job.status;
   rememberJob(job.id);
-  jobLabel.textContent = `任务 ${job.id}`;
+  jobLabel.textContent = job.archive_title ? `${job.archive_title} · 任务 ${job.id}` : `任务 ${job.id}`;
   updateProgress(job);
   renderFiles(job);
 
   messages.innerHTML = "";
+  if (job.queue_position) {
+    appendMessage(`任务已排队，前面还有 ${job.queue_position - 1} 个任务。`);
+  }
   if (job.message) {
     const remaining = cooldownRemaining(job);
     const suffix = remaining > 0 ? `（剩余 ${formatSeconds(remaining)}）` : "";
@@ -1092,11 +1263,15 @@ function renderJob(job) {
   const hasDownload = job.files.length > 0 || job.status === "completed_with_errors" || job.status === "completed";
   if (hasDownload) {
     downloadAll.href = `/api/jobs/${encodeURIComponent(job.id)}/download`;
+    if (job.download_filename) downloadAll.download = job.download_filename;
     downloadAll.classList.remove("disabled");
     downloadAll.setAttribute("aria-disabled", "false");
   }
 
-  const done = job.status === "completed" || job.status === "completed_with_errors";
+  const done = isTerminalJobStatus(job.status);
+  stopJobButton.hidden = done;
+  stopJobButton.disabled = done || Boolean(job.cancel_requested);
+  stopJobButton.textContent = job.cancel_requested && !done ? "停止中" : "停止任务";
   setBusy(!done);
   if (!done && cooldownRemaining(job) > 0) {
     serverState.textContent = "自动冷却";
@@ -1105,6 +1280,7 @@ function renderJob(job) {
     clearInterval(pollTimer);
     pollTimer = null;
   }
+  updateRunButtonState();
   loadHistory();
 }
 
@@ -1125,6 +1301,25 @@ async function pollJob(jobId) {
   }
 }
 
+async function stopActiveJob() {
+  if (!activeJobId) return;
+  stopJobButton.disabled = true;
+  stopJobButton.textContent = "停止中";
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(activeJobId)}/stop`, {
+      method: "POST",
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    renderJob(payload);
+    if (!isTerminalJobStatus(payload.status)) startPolling(payload.id);
+  } catch (error) {
+    setMessage(`停止失败：${error.message}`, "error");
+    stopJobButton.disabled = false;
+    stopJobButton.textContent = "停止任务";
+  }
+}
+
 async function createJob() {
   const urls = urlInput.value.trim();
   if (!urls) {
@@ -1133,13 +1328,15 @@ async function createJob() {
   }
 
   selectedFileUrl = null;
-  setBusy(true);
-  setMessage("任务已提交");
+  submittingJob = true;
+  updateRunButtonState();
+  setMessage("任务已加入队列");
   resultList.innerHTML = '<div class="empty-state">正在处理</div>';
   preview.textContent = "等待 Markdown 输出";
   openPreview.classList.add("disabled");
   downloadAll.classList.add("disabled");
   downloadAll.setAttribute("aria-disabled", "true");
+  downloadAll.removeAttribute("download");
   progressBar.style.width = "0%";
   progressCount.textContent = "0 / 0";
   progressLabel.textContent = "排队中";
@@ -1158,7 +1355,7 @@ async function createJob() {
     const response = await fetch("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ urls }),
+      body: JSON.stringify({ urls, archive_title: pendingArchiveTitle }),
     });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
@@ -1166,8 +1363,10 @@ async function createJob() {
     startPolling(payload.id);
     pollJob(payload.id);
   } catch (error) {
-    setBusy(false);
     setMessage(error.message, "error");
+  } finally {
+    submittingJob = false;
+    updateRunButtonState();
   }
 }
 
@@ -1177,7 +1376,7 @@ async function restoreJob(jobId) {
   preview.textContent = "正在恢复历史任务";
   switchPage("extract");
   const job = await pollJob(jobId);
-  const done = job && (job.status === "completed" || job.status === "completed_with_errors");
+  const done = job && isTerminalJobStatus(job.status);
   if (job && !done) startPolling(jobId);
 }
 
@@ -1192,8 +1391,12 @@ function renderHistory(jobs) {
     item.className = "history-item";
     item.type = "button";
     const summary = job.summary || {};
+    const title = job.archive_title || job.id;
+    const idText = job.archive_title ? ` · ${job.id}` : "";
+    const statusLabel = job.cancel_requested && !isTerminalJobStatus(job.status) ? "停止中" : statusText[job.status] || job.status;
+    const queueText = job.queue_position ? ` · 排队第 ${job.queue_position}` : "";
     item.innerHTML = `
-      <span class="history-title">${job.id} · ${statusText[job.status] || job.status}</span>
+      <span class="history-title">${title}${idText} · ${statusLabel}${queueText}</span>
       <span class="history-meta">${job.current || 0}/${job.total || 0} · 成功 ${summary.success_count || 0} · 失败 ${summary.error_count || 0} · 视频 ${formatSummaryVideoTotal(summary)} · 缓存 ${summary.cache_hit_count || 0}</span>
     `;
     item.addEventListener("click", () => restoreJob(job.id));
@@ -1216,25 +1419,38 @@ async function loadHistory() {
 async function init() {
   pageTabs.forEach((tab) => tab.addEventListener("click", () => switchPage(tab.dataset.page)));
   runButton.addEventListener("click", createJob);
+  stopJobButton.addEventListener("click", stopActiveJob);
   refreshHistoryButton.addEventListener("click", loadHistory);
-  discoverButton.addEventListener("click", discoverChannelVideos);
   refreshDiscoveryHistory.addEventListener("click", loadDiscoveryHistory);
   refreshChannels.addEventListener("click", loadChannels);
   addChannelsButton.addEventListener("click", addFollowedChannels);
+  selectAllChannelsButton.addEventListener("click", selectAllFollowedChannels);
+  invertChannelsButton.addEventListener("click", invertFollowedChannelSelection);
+  refreshSelectedChannelsButton.addEventListener("click", discoverChannelVideos);
   refreshChannelButton.addEventListener("click", refreshActiveChannel);
+  settingsToggleButton.addEventListener("click", () => setSettingsOpen(true));
+  settingsCloseButton.addEventListener("click", () => setSettingsOpen(false));
+  cancelSettingsButton.addEventListener("click", () => setSettingsOpen(false));
+  settingsBackdrop.addEventListener("click", () => setSettingsOpen(false));
+  saveSettingsButton.addEventListener("click", saveSettings);
   selectAllDiscovery.addEventListener("click", () => selectDiscoveryVideos(true));
   clearDiscoverySelection.addEventListener("click", () => selectDiscoveryVideos(false));
   importDiscovery.addEventListener("click", importSelectedDiscoveryUrls);
   discoveryFilterInput.addEventListener("input", renderDiscoveryCandidates);
-  urlInput.addEventListener("input", updateImportQueueSummary);
+  urlInput.addEventListener("input", () => {
+    pendingArchiveTitle = "";
+    updateImportQueueSummary();
+  });
   clearButton.addEventListener("click", () => {
     urlInput.value = "";
+    pendingArchiveTitle = "";
     updateImportQueueSummary();
     urlInput.focus();
   });
 
   updateImportQueueSummary();
-  await Promise.all([loadHistory(), loadDiscoveryHistory(), loadChannels()]);
+  updateRunButtonState();
+  await Promise.all([loadHistory(), loadDiscoveryHistory(), loadChannels(), loadSettings()]);
 
   const activeDiscoveryId = localStorage.getItem(ACTIVE_DISCOVERY_KEY);
   if (activeDiscoveryId) {
