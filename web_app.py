@@ -19,11 +19,13 @@ import tempfile
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
 import requests
@@ -49,6 +51,7 @@ OUTPUT_DIR = ROOT / "web_outputs"
 ENV_PATH = ROOT / ".env"
 DISCOVERY_DIR = OUTPUT_DIR / "discoveries"
 CHANNELS_DIR = OUTPUT_DIR / "channels"
+TRANSLATION_DIR = OUTPUT_DIR / "translations"
 CHANNEL_INDEX_PATH = CHANNELS_DIR / "index.json"
 MAX_BODY_BYTES = 128 * 1024
 
@@ -93,6 +96,10 @@ def env_bool(name: str, default: bool = False) -> bool:
     if not value:
         return default
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+MAX_UPLOAD_BYTES = max(1, env_int("SUBTITLE_TRANSLATION_MAX_UPLOAD_BYTES", 200 * 1024 * 1024))
+TRANSLATION_SUPPORTED_SUFFIXES = {".md", ".txt", ".srt", ".vtt"}
 
 
 def normalize_discovery_provider(value: object) -> str:
@@ -148,6 +155,21 @@ DISCOVERY_API_FALLBACK_TO_YTDLP = env_bool("SUBTITLE_DISCOVERY_API_FALLBACK_TO_Y
 DISCOVERY_PROVIDER = normalize_discovery_provider(os.environ.get("SUBTITLE_DISCOVERY_PROVIDER")) or (
     "youtube_api" if YOUTUBE_DATA_API_KEY else "yt_dlp"
 )
+TRANSLATION_API_KEY = clean_scalar(
+    os.environ.get("TRANSLATION_API_KEY")
+    or os.environ.get("ONEAPI_API_KEY")
+    or os.environ.get("ONEAPI_COMATE_API_KEY")
+)
+TRANSLATION_API_URL = clean_scalar(
+    os.environ.get("TRANSLATION_API_URL")
+    or "https://oneapi-comate.baidu-int.com/v1/chat/completions"
+)
+TRANSLATION_MODEL = clean_scalar(os.environ.get("TRANSLATION_MODEL") or "gpt-5.5")
+TRANSLATION_API_TIMEOUT_SECONDS = max(10.0, env_float("TRANSLATION_API_TIMEOUT_SECONDS", 120.0))
+TRANSLATION_API_MAX_ATTEMPTS = max(1, env_int("TRANSLATION_API_MAX_ATTEMPTS", 3))
+TRANSLATION_RETRY_BASE_SECONDS = max(0.0, env_float("TRANSLATION_RETRY_BASE_SECONDS", 2.0))
+TRANSLATION_CHUNK_CHARS = max(1500, env_int("TRANSLATION_CHUNK_CHARS", 8000))
+TRANSLATION_FILE_MAX_ATTEMPTS = max(1, env_int("TRANSLATION_FILE_MAX_ATTEMPTS", 2))
 DISCOVERY_YTDLP_MAX_PER_SOURCE_WITHOUT_API = max(
     1,
     min(
@@ -216,14 +238,52 @@ class DiscoveryTask:
     source_progress: List[Dict[str, object]] = field(default_factory=list)
 
 
+@dataclass
+class TranslationFile:
+    filename: str
+    title: str
+    source_filename: str
+    size_bytes: int
+    elapsed_seconds: float
+    chunk_count: int
+    retry_count: int = 0
+
+
+@dataclass
+class TranslationJob:
+    id: str
+    original_filename: str
+    source_root_name: str
+    output_folder_name: str
+    input_zip_path: Path
+    output_dir: Path
+    status: str = "queued"
+    current: int = 0
+    total: int = 0
+    cancel_requested: bool = False
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    message: str = ""
+    files: List[TranslationFile] = field(default_factory=list)
+    errors: List[Dict[str, object]] = field(default_factory=list)
+    retry_source_names: List[str] = field(default_factory=list)
+
+
 jobs: Dict[str, Job] = {}
 discovery_tasks: Dict[str, DiscoveryTask] = {}
+translation_jobs: Dict[str, TranslationJob] = {}
 jobs_lock = threading.Lock()
 discovery_tasks_lock = threading.Lock()
+translation_jobs_lock = threading.Lock()
 settings_lock = threading.Lock()
 job_queue: List[str] = []
 job_queue_condition = threading.Condition()
 job_worker_thread: Optional[threading.Thread] = None
+translation_job_queue: List[str] = []
+translation_job_queue_condition = threading.Condition()
+translation_job_worker_thread: Optional[threading.Thread] = None
 
 
 TERMINAL_JOB_STATUSES = {"completed", "completed_with_errors", "failed", "cancelled"}
@@ -251,6 +311,14 @@ def reload_runtime_settings_from_env() -> None:
     global YOUTUBE_API_RETRY_BASE_SECONDS
     global DISCOVERY_API_FALLBACK_TO_YTDLP
     global DISCOVERY_PROVIDER
+    global TRANSLATION_API_KEY
+    global TRANSLATION_API_URL
+    global TRANSLATION_MODEL
+    global TRANSLATION_API_TIMEOUT_SECONDS
+    global TRANSLATION_API_MAX_ATTEMPTS
+    global TRANSLATION_RETRY_BASE_SECONDS
+    global TRANSLATION_CHUNK_CHARS
+    global TRANSLATION_FILE_MAX_ATTEMPTS
 
     DISCOVERY_DEFAULT_MAX_PER_SOURCE = max(1, env_int("SUBTITLE_DISCOVERY_MAX_PER_SOURCE", 300))
     DISCOVERY_DEFAULT_DETAIL_LOOKUP_LIMIT = max(0, env_int("SUBTITLE_DISCOVERY_DETAIL_LOOKUP_LIMIT", DISCOVERY_DEFAULT_MAX_PER_SOURCE))
@@ -262,6 +330,21 @@ def reload_runtime_settings_from_env() -> None:
     DISCOVERY_PROVIDER = normalize_discovery_provider(os.environ.get("SUBTITLE_DISCOVERY_PROVIDER")) or (
         "youtube_api" if YOUTUBE_DATA_API_KEY else "yt_dlp"
     )
+    TRANSLATION_API_KEY = clean_scalar(
+        os.environ.get("TRANSLATION_API_KEY")
+        or os.environ.get("ONEAPI_API_KEY")
+        or os.environ.get("ONEAPI_COMATE_API_KEY")
+    )
+    TRANSLATION_API_URL = clean_scalar(
+        os.environ.get("TRANSLATION_API_URL")
+        or "https://oneapi-comate.baidu-int.com/v1/chat/completions"
+    )
+    TRANSLATION_MODEL = clean_scalar(os.environ.get("TRANSLATION_MODEL") or "gpt-5.5")
+    TRANSLATION_API_TIMEOUT_SECONDS = max(10.0, env_float("TRANSLATION_API_TIMEOUT_SECONDS", 120.0))
+    TRANSLATION_API_MAX_ATTEMPTS = max(1, env_int("TRANSLATION_API_MAX_ATTEMPTS", 3))
+    TRANSLATION_RETRY_BASE_SECONDS = max(0.0, env_float("TRANSLATION_RETRY_BASE_SECONDS", 2.0))
+    TRANSLATION_CHUNK_CHARS = max(1500, env_int("TRANSLATION_CHUNK_CHARS", 8000))
+    TRANSLATION_FILE_MAX_ATTEMPTS = max(1, env_int("TRANSLATION_FILE_MAX_ATTEMPTS", 2))
 
 
 def write_env_values(updates: Dict[str, str]) -> None:
@@ -292,6 +375,9 @@ def settings_payload() -> Dict[str, object]:
     return {
         "youtube_api_key_configured": bool(YOUTUBE_DATA_API_KEY),
         "youtube_api_key_masked": mask_secret(YOUTUBE_DATA_API_KEY),
+        "translation_api_key_configured": bool(TRANSLATION_API_KEY),
+        "translation_api_key_masked": mask_secret(TRANSLATION_API_KEY),
+        "translation_model": TRANSLATION_MODEL,
         "discovery_provider": DISCOVERY_PROVIDER,
         "discovery_check_limit": DISCOVERY_DEFAULT_MAX_PER_SOURCE,
         "api_fallback_to_ytdlp": DISCOVERY_API_FALLBACK_TO_YTDLP,
@@ -310,6 +396,13 @@ def update_settings_from_payload(payload: Dict[str, object]) -> Dict[str, object
             updates["YOUTUBE_DATA_API_KEY"] = api_key
         elif payload.get("clear_youtube_api_key"):
             updates["YOUTUBE_DATA_API_KEY"] = ""
+
+    if "translation_api_key" in payload:
+        api_key = clean_scalar(payload.get("translation_api_key") or "")
+        if api_key and "•" not in api_key:
+            updates["TRANSLATION_API_KEY"] = api_key
+        elif payload.get("clear_translation_api_key"):
+            updates["TRANSLATION_API_KEY"] = ""
 
     if "discovery_provider" in payload:
         provider = normalize_discovery_provider(payload.get("discovery_provider"))
@@ -2662,6 +2755,678 @@ def process_job(job_id: str) -> None:
     write_job_artifacts(final_job)
 
 
+def translation_download_filename(job: TranslationJob) -> str:
+    return f"{safe_download_name_part(job.output_folder_name) or 'subtitles_zh'}.zip"
+
+
+def translated_output_dir(job: TranslationJob) -> Path:
+    return job.output_dir / job.output_folder_name
+
+
+def translation_job_queue_position(job_id: str) -> int:
+    with translation_job_queue_condition:
+        try:
+            return translation_job_queue.index(job_id) + 1
+        except ValueError:
+            return 0
+
+
+def translation_job_to_dict(job: TranslationJob) -> Dict[str, object]:
+    elapsed_values = [file.elapsed_seconds for file in job.files]
+    elapsed_values.extend(float(error.get("elapsed_seconds", 0)) for error in job.errors)
+    completed_count = len(elapsed_values)
+    wall_time = None
+    if job.started_at:
+        wall_time = round((job.completed_at or time.time()) - job.started_at, 3)
+    return {
+        "id": job.id,
+        "original_filename": job.original_filename,
+        "source_root_name": job.source_root_name,
+        "output_folder_name": job.output_folder_name,
+        "download_filename": translation_download_filename(job),
+        "status": job.status,
+        "current": job.current,
+        "total": job.total,
+        "cancel_requested": job.cancel_requested,
+        "queue_position": translation_job_queue_position(job.id),
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+        "started_at": job.started_at,
+        "completed_at": job.completed_at,
+        "message": job.message,
+        "files": [file.__dict__ for file in sorted(job.files, key=lambda item: item.filename)],
+        "errors": job.errors,
+        "retry_source_names": job.retry_source_names,
+        "summary": {
+            "completed_count": completed_count,
+            "success_count": len(job.files),
+            "error_count": len(job.errors),
+            "average_elapsed_seconds": round(sum(elapsed_values) / completed_count, 3) if completed_count else 0,
+            "total_item_elapsed_seconds": round(sum(elapsed_values), 3),
+            "wall_elapsed_seconds": wall_time,
+        },
+    }
+
+
+def persist_translation_summary(job: Optional[TranslationJob]) -> None:
+    if not job:
+        return
+    job.output_dir.mkdir(parents=True, exist_ok=True)
+    (job.output_dir / "translation_summary.json").write_text(
+        json.dumps(translation_job_to_dict(job), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def translation_job_from_manifest(path: Path) -> Optional[TranslationJob]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    job_id = clean_scalar(data.get("id") or path.parent.name)
+    if not job_id:
+        return None
+    status = clean_scalar(data.get("status") or "completed")
+    errors = list(data.get("errors") or [])
+    if status in {"queued", "running"}:
+        status = "completed_with_errors"
+        errors.append(
+            {
+                "source_filename": "",
+                "message": "服务重启后，未完成翻译已中断；已生成文件仍可下载。",
+                "elapsed_seconds": 0,
+            }
+        )
+
+    files = []
+    for item in data.get("files") or []:
+        try:
+            files.append(
+                TranslationFile(
+                    filename=clean_scalar(item.get("filename")),
+                    title=clean_scalar(item.get("title")),
+                    source_filename=clean_scalar(item.get("source_filename")),
+                    size_bytes=int(item.get("size_bytes") or 0),
+                    elapsed_seconds=float(item.get("elapsed_seconds") or 0),
+                    chunk_count=int(item.get("chunk_count") or 0),
+                    retry_count=int(item.get("retry_count") or 0),
+                )
+            )
+        except Exception:
+            continue
+
+    return TranslationJob(
+        id=job_id,
+        original_filename=clean_scalar(data.get("original_filename") or ""),
+        source_root_name=clean_scalar(data.get("source_root_name") or ""),
+        output_folder_name=clean_scalar(data.get("output_folder_name") or f"{job_id}_zh"),
+        input_zip_path=path.parent / "input.zip",
+        output_dir=path.parent,
+        status=status,
+        current=int(data.get("current") or len(files) + len(errors)),
+        total=int(data.get("total") or len(files) + len(errors)),
+        cancel_requested=bool(data.get("cancel_requested", False)) if status not in TERMINAL_JOB_STATUSES else False,
+        created_at=float(data.get("created_at") or path.stat().st_mtime),
+        updated_at=float(data.get("updated_at") or path.stat().st_mtime),
+        started_at=data.get("started_at"),
+        completed_at=data.get("completed_at"),
+        message=clean_scalar(data.get("message") or ""),
+        files=files,
+        errors=errors,
+        retry_source_names=[
+            clean_scalar(item)
+            for item in (data.get("retry_source_names") or [])
+            if clean_scalar(item)
+        ],
+    )
+
+
+def load_existing_translation_jobs() -> None:
+    TRANSLATION_DIR.mkdir(parents=True, exist_ok=True)
+    loaded = 0
+    for summary_path in TRANSLATION_DIR.glob("*/translation_summary.json"):
+        job = translation_job_from_manifest(summary_path)
+        if not job:
+            continue
+        with translation_jobs_lock:
+            translation_jobs[job.id] = job
+        loaded += 1
+    if loaded:
+        print(f"Loaded {loaded} historical translation jobs", flush=True)
+
+
+def translation_zip_parts(name: str) -> List[str]:
+    normalized = name.replace("\\", "/")
+    if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+        return []
+    parts = [part for part in normalized.split("/") if part and part != "."]
+    if not parts or any(part == ".." for part in parts):
+        return []
+    if parts[0] == "__MACOSX" or any(part == ".DS_Store" for part in parts):
+        return []
+    return parts
+
+
+def is_translation_member(info: zipfile.ZipInfo) -> bool:
+    if info.is_dir():
+        return False
+    parts = translation_zip_parts(info.filename)
+    if not parts:
+        return False
+    suffix = Path(parts[-1]).suffix.lower()
+    return suffix in TRANSLATION_SUPPORTED_SUFFIXES
+
+
+def inspect_translation_zip(zip_path: Path, uploaded_filename: str) -> Tuple[List[str], str]:
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            members = [info.filename for info in archive.infolist() if is_translation_member(info)]
+    except zipfile.BadZipFile:
+        raise ValueError("上传文件不是有效的 ZIP 包。")
+
+    if not members:
+        supported = "、".join(sorted(TRANSLATION_SUPPORTED_SUFFIXES))
+        raise ValueError(f"ZIP 包里没有可翻译的字幕文件（支持 {supported}）。")
+
+    member_parts = [translation_zip_parts(name) for name in members]
+    first_parts = [parts[0] for parts in member_parts if parts]
+    if first_parts and len(set(first_parts)) == 1 and all(len(parts) > 1 for parts in member_parts):
+        root_name = first_parts[0]
+    else:
+        root_name = Path(uploaded_filename).stem
+    root_name = safe_download_name_part(root_name) or "subtitles"
+    return members, root_name
+
+
+def split_text_for_translation(text: str) -> List[str]:
+    max_chars = max(1500, TRANSLATION_CHUNK_CHARS)
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: List[str] = []
+    current = ""
+    blocks = re.split(r"(\n{2,})", text)
+    for index in range(0, len(blocks), 2):
+        block = blocks[index]
+        separator = blocks[index + 1] if index + 1 < len(blocks) else ""
+        piece = block + separator
+        if not piece:
+            continue
+        if len(piece) > max_chars:
+            if current:
+                chunks.append(current)
+                current = ""
+            for start in range(0, len(piece), max_chars):
+                chunks.append(piece[start : start + max_chars])
+            continue
+        if current and len(current) + len(piece) > max_chars:
+            chunks.append(current)
+            current = piece
+        else:
+            current += piece
+    if current:
+        chunks.append(current)
+    return chunks or [text]
+
+
+def clean_translation_response(text: str) -> str:
+    text = text.strip()
+    match = re.fullmatch(r"```(?:markdown|md|text)?\s*\n(.*)\n```", text, flags=re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+def translation_error_message(response: requests.Response) -> str:
+    text = response.text.strip()
+    if not text:
+        return f"HTTP {response.status_code}"
+    try:
+        data = response.json()
+        message = data.get("error", {}).get("message") if isinstance(data.get("error"), dict) else data.get("error")
+        if message:
+            return f"HTTP {response.status_code}: {clean_scalar(message)}"
+    except Exception:
+        pass
+    return f"HTTP {response.status_code}: {clean_scalar(text)[:300]}"
+
+
+def call_translation_api(markdown_chunk: str) -> str:
+    if not TRANSLATION_API_KEY:
+        raise ValueError("请先在设置里填写翻译 API Key。")
+
+    system_prompt = (
+        "你是专业字幕翻译。把用户提供的英文 Markdown 字幕翻译成简体中文。"
+        "必须保留 Markdown 结构、空行、列表、说话人标记、时间戳、URL 和元数据键名。"
+        "article_id、source_url、publish_date 这类标识值不要翻译；title 的值需要翻译成中文。"
+        "不要总结，不要添加解释，只返回翻译后的内容。"
+    )
+    payload = {
+        "model": TRANSLATION_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": markdown_chunk},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {TRANSLATION_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, TRANSLATION_API_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.post(
+                TRANSLATION_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=TRANSLATION_API_TIMEOUT_SECONDS,
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(translation_error_message(response))
+            data = response.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise RuntimeError("翻译接口没有返回有效内容。")
+            return clean_translation_response(content)
+        except Exception as error:
+            last_error = error
+            if attempt >= TRANSLATION_API_MAX_ATTEMPTS:
+                break
+            delay = min(30.0, TRANSLATION_RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+            time.sleep(delay + random.uniform(0, 0.6))
+    raise RuntimeError(str(last_error) if last_error else "翻译接口调用失败。")
+
+
+def extract_markdown_title(markdown: str) -> str:
+    patterns = [
+        r"^title\s*:\s*(.+)$",
+        r"^标题\s*[：:]\s*(.+)$",
+        r"^#\s+(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, markdown, flags=re.MULTILINE | re.IGNORECASE)
+        if match:
+            title = clean_scalar(match.group(1).strip().strip('"').strip("'"))
+            if title:
+                return title
+    return ""
+
+
+def safe_translated_filename(title: str, fallback: str, suffix: str, existing: set) -> str:
+    base = safe_download_name_part(title) or safe_download_name_part(Path(fallback).stem) or "subtitle"
+    suffix = suffix if suffix.startswith(".") else f".{suffix}"
+    candidate = f"{base}{suffix}"
+    counter = 2
+    while candidate in existing:
+        candidate = f"{base}_{counter}{suffix}"
+        counter += 1
+    existing.add(candidate)
+    return candidate
+
+
+def decode_subtitle_text(data: bytes) -> str:
+    for encoding in ["utf-8-sig", "utf-8", "cp1252"]:
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def is_translation_cancel_requested(job_id: str) -> bool:
+    with translation_jobs_lock:
+        job = translation_jobs.get(job_id)
+        return bool(job and job.cancel_requested)
+
+
+def update_translation_job(job_id: str, **changes) -> None:
+    job = None
+    with translation_jobs_lock:
+        job = translation_jobs[job_id]
+        for key, value in changes.items():
+            setattr(job, key, value)
+        job.updated_at = time.time()
+    persist_translation_summary(job)
+
+
+def add_translation_file(job_id: str, file: TranslationFile) -> None:
+    job = None
+    with translation_jobs_lock:
+        job = translation_jobs[job_id]
+        if job.status in TERMINAL_JOB_STATUSES or job.cancel_requested:
+            return
+        job.files.append(file)
+        job.updated_at = time.time()
+    persist_translation_summary(job)
+
+
+def add_translation_error(job_id: str, error: Dict[str, object]) -> None:
+    job = None
+    with translation_jobs_lock:
+        job = translation_jobs[job_id]
+        if job.status in TERMINAL_JOB_STATUSES or job.cancel_requested:
+            return
+        job.errors.append(error)
+        job.updated_at = time.time()
+    persist_translation_summary(job)
+
+
+def remove_queued_translation_job(job_id: str) -> bool:
+    with translation_job_queue_condition:
+        before = len(translation_job_queue)
+        translation_job_queue[:] = [queued_id for queued_id in translation_job_queue if queued_id != job_id]
+        return len(translation_job_queue) != before
+
+
+def enqueue_translation_job(job_id: str) -> None:
+    with translation_job_queue_condition:
+        if job_id not in translation_job_queue:
+            translation_job_queue.append(job_id)
+        translation_job_queue_condition.notify()
+    ensure_translation_job_worker()
+
+
+def ensure_translation_job_worker() -> None:
+    global translation_job_worker_thread
+    with translation_job_queue_condition:
+        if translation_job_worker_thread and translation_job_worker_thread.is_alive():
+            return
+        translation_job_worker_thread = threading.Thread(target=translation_job_worker_loop, daemon=True)
+        translation_job_worker_thread.start()
+
+
+def translation_job_worker_loop() -> None:
+    while True:
+        with translation_job_queue_condition:
+            while not translation_job_queue:
+                translation_job_queue_condition.wait()
+            job_id = translation_job_queue.pop(0)
+
+        with translation_jobs_lock:
+            job = translation_jobs.get(job_id)
+            should_run = bool(job and job.status == "queued" and not job.cancel_requested)
+        if not should_run:
+            continue
+
+        try:
+            process_translation_job(job_id)
+        except Exception as error:
+            traceback.print_exc()
+            with translation_jobs_lock:
+                job = translation_jobs.get(job_id)
+                if not job:
+                    continue
+                job.status = "failed"
+                job.message = str(error)
+                job.completed_at = time.time()
+                job.updated_at = time.time()
+                failed_job = job
+            persist_translation_summary(failed_job)
+
+
+def request_translation_stop(job_id: str) -> TranslationJob:
+    remove_from_queue = False
+    with translation_jobs_lock:
+        job = translation_jobs.get(job_id)
+        if not job:
+            raise ValueError("Translation job not found.")
+        if job.status in TERMINAL_JOB_STATUSES:
+            return job
+        job.cancel_requested = True
+        if job.status == "queued":
+            remove_from_queue = True
+            job.message = "已停止，任务尚未开始。"
+        else:
+            job.message = "已停止，当前未完成文件已忽略。"
+        job.status = "cancelled"
+        job.completed_at = time.time()
+        job.updated_at = time.time()
+        stopped_job = job
+    if remove_from_queue:
+        remove_queued_translation_job(job_id)
+    persist_translation_summary(stopped_job)
+    return stopped_job
+
+
+def request_translation_retry(job_id: str) -> TranslationJob:
+    with translation_jobs_lock:
+        job = translation_jobs.get(job_id)
+        if not job:
+            raise ValueError("Translation job not found.")
+        if job.status not in TERMINAL_JOB_STATUSES:
+            raise ValueError("当前任务还未结束，不能重试。")
+        if not job.input_zip_path.exists():
+            raise ValueError("原始 ZIP 文件不存在，无法重试。")
+
+        failed_sources = [
+            clean_scalar(error.get("source_filename") or "")
+            for error in job.errors
+            if clean_scalar(error.get("source_filename") or "")
+        ]
+        if not failed_sources and job.status != "failed":
+            raise ValueError("当前任务没有可重试的失败文件。")
+
+        job.retry_source_names = failed_sources
+        if not failed_sources:
+            job.files = []
+        job.errors = []
+        job.status = "queued"
+        job.cancel_requested = False
+        job.current = len(job.files)
+        job.total = len(job.files) + len(failed_sources) if failed_sources else 0
+        job.started_at = None
+        job.completed_at = None
+        job.message = "等待重试"
+        job.updated_at = time.time()
+        retry_job = job
+    persist_translation_summary(retry_job)
+    enqueue_translation_job(job_id)
+    return retry_job
+
+
+def set_translation_message(job_id: str, message: str) -> None:
+    job = None
+    with translation_jobs_lock:
+        job = translation_jobs.get(job_id)
+        if not job or job.status in TERMINAL_JOB_STATUSES:
+            return
+        job.message = message
+        job.updated_at = time.time()
+    persist_translation_summary(job)
+
+
+def translate_member(
+    job_id: str,
+    archive: zipfile.ZipFile,
+    member_name: str,
+    output_dir: Path,
+    existing_names: set,
+) -> TranslationFile:
+    started = time.monotonic()
+    source_parts = translation_zip_parts(member_name)
+    source_filename = "/".join(source_parts) or member_name
+    source_basename = source_parts[-1] if source_parts else Path(member_name).name
+    suffix = Path(source_basename).suffix or ".md"
+
+    raw = archive.read(member_name)
+    markdown = decode_subtitle_text(raw)
+    chunks = split_text_for_translation(markdown)
+    translated_chunks = []
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        if is_translation_cancel_requested(job_id):
+            raise JobCancelled()
+        set_translation_message(
+            job_id,
+            f"正在翻译 {source_basename}（{chunk_index}/{len(chunks)}）",
+        )
+        translated_chunks.append(call_translation_api(chunk))
+
+    translated = "\n\n".join(part.strip() for part in translated_chunks if part.strip()).strip() + "\n"
+    title = extract_markdown_title(translated) or extract_markdown_title(markdown) or Path(source_basename).stem
+    filename = safe_translated_filename(title, source_basename, suffix, existing_names)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / filename
+    path.write_text(translated, encoding="utf-8")
+    return TranslationFile(
+        filename=filename,
+        title=title,
+        source_filename=source_filename,
+        size_bytes=path.stat().st_size,
+        elapsed_seconds=round(time.monotonic() - started, 3),
+        chunk_count=len(chunks),
+    )
+
+
+def translate_member_with_retry(
+    job_id: str,
+    archive: zipfile.ZipFile,
+    member_name: str,
+    output_dir: Path,
+    existing_names: set,
+) -> TranslationFile:
+    last_error: Optional[Exception] = None
+    source_basename = Path(member_name.replace("\\", "/")).name or member_name
+    for attempt in range(1, TRANSLATION_FILE_MAX_ATTEMPTS + 1):
+        if is_translation_cancel_requested(job_id):
+            raise JobCancelled()
+        try:
+            if attempt > 1:
+                set_translation_message(job_id, f"正在重试 {source_basename}（第 {attempt} 次）")
+            file = translate_member(job_id, archive, member_name, output_dir, existing_names)
+            file.retry_count = attempt - 1
+            return file
+        except JobCancelled:
+            raise
+        except Exception as error:
+            last_error = error
+            if attempt >= TRANSLATION_FILE_MAX_ATTEMPTS:
+                break
+            delay = min(30.0, TRANSLATION_RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+            time.sleep(delay + random.uniform(0, 0.6))
+    raise RuntimeError(str(last_error) if last_error else "翻译文件失败。")
+
+
+def process_translation_job(job_id: str) -> None:
+    with translation_jobs_lock:
+        job = translation_jobs.get(job_id)
+        if not job:
+            return
+        if job.cancel_requested or job.status == "cancelled":
+            job.status = "cancelled"
+            job.message = "已停止，任务尚未开始。"
+            job.completed_at = time.time()
+            job.updated_at = time.time()
+            cancelled_job = job
+            write_cancelled = True
+        elif job.status != "queued":
+            return
+        else:
+            job.status = "running"
+            job.started_at = time.time()
+            job.updated_at = time.time()
+            started_job = job
+            write_cancelled = False
+    if write_cancelled:
+        persist_translation_summary(cancelled_job)
+        return
+    persist_translation_summary(started_job)
+
+    cancelled = False
+    try:
+        with zipfile.ZipFile(started_job.input_zip_path) as archive:
+            all_member_names, _root_name = inspect_translation_zip(started_job.input_zip_path, started_job.original_filename)
+            output_dir = translated_output_dir(started_job)
+            retry_source_names = list(started_job.retry_source_names)
+            if retry_source_names:
+                retry_set = set(retry_source_names)
+                member_names = [
+                    name
+                    for name in all_member_names
+                    if name in retry_set or "/".join(translation_zip_parts(name)) in retry_set
+                ]
+                if not member_names:
+                    raise ValueError("没有找到可重试的失败文件。")
+                existing_names: set = {file.filename for file in started_job.files}
+            else:
+                member_names = all_member_names
+                existing_names = set()
+
+            if output_dir.exists() and not retry_source_names:
+                shutil.rmtree(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            with translation_jobs_lock:
+                job = translation_jobs[job_id]
+                if retry_source_names:
+                    job.current = len(job.files)
+                    job.total = len(job.files) + len(member_names)
+                else:
+                    job.current = 0
+                    job.total = len(member_names)
+                job.updated_at = time.time()
+                progress_job = job
+            persist_translation_summary(progress_job)
+
+            for member_name in member_names:
+                if is_translation_cancel_requested(job_id):
+                    cancelled = True
+                    break
+                item_start = time.monotonic()
+                try:
+                    file = translate_member_with_retry(job_id, archive, member_name, output_dir, existing_names)
+                    add_translation_file(job_id, file)
+                except JobCancelled:
+                    cancelled = True
+                    break
+                except Exception as error:
+                    traceback.print_exc()
+                    add_translation_error(
+                        job_id,
+                        {
+                            "source_filename": member_name,
+                            "message": str(error),
+                            "elapsed_seconds": round(time.monotonic() - item_start, 3),
+                            "retry_count": max(0, TRANSLATION_FILE_MAX_ATTEMPTS - 1),
+                        },
+                    )
+
+                with translation_jobs_lock:
+                    job = translation_jobs[job_id]
+                    job.current += 1
+                    job.updated_at = time.time()
+                    progress_job = job
+                persist_translation_summary(progress_job)
+    except JobCancelled:
+        cancelled = True
+    except Exception as error:
+        with translation_jobs_lock:
+            job = translation_jobs[job_id]
+            job.status = "failed"
+            job.message = str(error)
+            job.completed_at = time.time()
+            job.updated_at = time.time()
+            failed_job = job
+        persist_translation_summary(failed_job)
+        return
+
+    with translation_jobs_lock:
+        job = translation_jobs[job_id]
+        if cancelled or job.cancel_requested:
+            job.status = "cancelled"
+            job.cancel_requested = True
+            job.message = "已停止，当前未完成文件已忽略。"
+        else:
+            job.status = "completed_with_errors" if job.errors else "completed"
+            job.current = job.total
+            job.message = "翻译完成。"
+        job.retry_source_names = []
+        job.completed_at = time.time()
+        job.updated_at = time.time()
+        final_job = job
+    persist_translation_summary(final_job)
+
+
 class AppHandler(BaseHTTPRequestHandler):
     server_version = "SubtitleMarkdownTool/1.0"
     head_only = False
@@ -2679,6 +3444,8 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.serve_static(path.removeprefix("/static/"))
         if path == "/api/jobs":
             return self.handle_jobs_list()
+        if path == "/api/translation-jobs":
+            return self.handle_translation_jobs_list()
         if path == "/api/settings":
             return self.handle_settings_get()
         if path == "/api/channels":
@@ -2693,6 +3460,8 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.handle_discovery_get(path)
         if path.startswith("/api/jobs/"):
             return self.handle_job_get(path)
+        if path.startswith("/api/translation-jobs/"):
+            return self.handle_translation_job_get(path)
         return self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
@@ -2700,8 +3469,12 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/jobs":
             return self.handle_create_job()
+        if parsed.path == "/api/translation-jobs":
+            return self.handle_create_translation_job()
         if parsed.path.startswith("/api/jobs/"):
             return self.handle_job_post(parsed.path)
+        if parsed.path.startswith("/api/translation-jobs/"):
+            return self.handle_translation_job_post(parsed.path)
         if parsed.path == "/api/settings":
             return self.handle_settings_post()
         if parsed.path == "/api/channels":
@@ -2733,6 +3506,41 @@ class AppHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         return json.loads(body.decode("utf-8") or "{}")
 
+    def read_multipart_uploads(self) -> List[Tuple[str, bytes]]:
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            raise ValueError("请使用表单上传 ZIP 文件。")
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            raise ValueError("上传内容为空。")
+        if length > MAX_UPLOAD_BYTES:
+            raise ValueError("上传文件太大。")
+        body = self.rfile.read(length)
+        raw_message = (
+            f"Content-Type: {content_type}\r\n"
+            "MIME-Version: 1.0\r\n\r\n"
+        ).encode("utf-8") + body
+        message = BytesParser(policy=email_policy).parsebytes(raw_message)
+        if not message.is_multipart():
+            raise ValueError("上传表单格式不正确。")
+        uploads: List[Tuple[str, bytes]] = []
+        for part in message.iter_parts():
+            if part.get_content_disposition() != "form-data":
+                continue
+            filename = clean_scalar(part.get_filename() or "")
+            if not filename:
+                continue
+            data = part.get_payload(decode=True) or b""
+            if not data:
+                raise ValueError("上传文件为空。")
+            uploads.append((filename, data))
+        if not uploads:
+            raise ValueError("没有找到上传的 ZIP 文件。")
+        return uploads
+
+    def read_multipart_upload(self) -> Tuple[str, bytes]:
+        return self.read_multipart_uploads()[0]
+
     def handle_create_job(self):
         try:
             payload = self.read_json_body()
@@ -2755,6 +3563,58 @@ class AppHandler(BaseHTTPRequestHandler):
         enqueue_job(job_id)
         return self.send_json(job_to_dict(job), HTTPStatus.CREATED)
 
+    def handle_create_translation_job(self):
+        try:
+            if not TRANSLATION_API_KEY:
+                raise ValueError("请先在设置里填写翻译 API Key。")
+            uploads = self.read_multipart_uploads()
+            created_jobs = []
+            upload_errors = []
+            for filename, data in uploads:
+                try:
+                    if Path(filename).suffix.lower() != ".zip":
+                        raise ValueError("请上传 ZIP 文件。")
+                    job_id = uuid.uuid4().hex[:12]
+                    output_dir = TRANSLATION_DIR / job_id
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    input_zip_path = output_dir / "input.zip"
+                    input_zip_path.write_bytes(data)
+                    members, root_name = inspect_translation_zip(input_zip_path, filename)
+                    output_folder_name = f"{root_name}_zh"
+                    job = TranslationJob(
+                        id=job_id,
+                        original_filename=safe_download_name_part(filename) or "subtitles.zip",
+                        source_root_name=root_name,
+                        output_folder_name=output_folder_name,
+                        input_zip_path=input_zip_path,
+                        output_dir=output_dir,
+                        total=len(members),
+                        message="等待翻译",
+                    )
+                    created_jobs.append(job)
+                except Exception as item_error:
+                    upload_errors.append({"filename": filename, "message": str(item_error)})
+            if not created_jobs:
+                message = upload_errors[0]["message"] if upload_errors else "没有可用的 ZIP 文件。"
+                raise ValueError(message)
+        except ValueError as error:
+            status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE if "太大" in str(error) else HTTPStatus.BAD_REQUEST
+            return self.send_json({"error": str(error)}, status)
+        except Exception as error:
+            return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+
+        for job in created_jobs:
+            with translation_jobs_lock:
+                translation_jobs[job.id] = job
+            persist_translation_summary(job)
+            enqueue_translation_job(job.id)
+
+        jobs_payload = [translation_job_to_dict(job) for job in created_jobs]
+        payload = dict(jobs_payload[0])
+        payload["jobs"] = jobs_payload
+        payload["upload_errors"] = upload_errors
+        return self.send_json(payload, HTTPStatus.CREATED)
+
     def handle_job_post(self, path: str):
         parts = [unquote(part) for part in path.split("/") if part]
         if len(parts) == 4 and parts[3] in {"stop", "cancel"}:
@@ -2763,6 +3623,26 @@ class AppHandler(BaseHTTPRequestHandler):
                 return self.send_json(job_to_dict(job))
             except ValueError as error:
                 return self.send_json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+            except Exception as error:
+                return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        return self.send_error(HTTPStatus.NOT_FOUND)
+
+    def handle_translation_job_post(self, path: str):
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 4 and parts[3] in {"stop", "cancel"}:
+            try:
+                job = request_translation_stop(parts[2])
+                return self.send_json(translation_job_to_dict(job))
+            except ValueError as error:
+                return self.send_json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+            except Exception as error:
+                return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+        if len(parts) == 4 and parts[3] == "retry":
+            try:
+                job = request_translation_retry(parts[2])
+                return self.send_json(translation_job_to_dict(job))
+            except ValueError as error:
+                return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             except Exception as error:
                 return self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
         return self.send_error(HTTPStatus.NOT_FOUND)
@@ -2944,6 +3824,30 @@ class AppHandler(BaseHTTPRequestHandler):
             }
         return self.send_json(payload)
 
+    def handle_translation_jobs_list(self):
+        with translation_jobs_lock:
+            job_list = sorted(translation_jobs.values(), key=lambda item: item.updated_at, reverse=True)
+            payload = {
+                "jobs": [
+                    {
+                        "id": job.id,
+                        "original_filename": job.original_filename,
+                        "source_root_name": job.source_root_name,
+                        "output_folder_name": job.output_folder_name,
+                        "download_filename": translation_download_filename(job),
+                        "status": job.status,
+                        "current": job.current,
+                        "total": job.total,
+                        "cancel_requested": job.cancel_requested,
+                        "queue_position": translation_job_queue_position(job.id),
+                        "updated_at": job.updated_at,
+                        "summary": translation_job_to_dict(job)["summary"],
+                    }
+                    for job in job_list[:50]
+                ]
+            }
+        return self.send_json(payload)
+
     def handle_job_get(self, path: str):
         parts = [unquote(part) for part in path.split("/") if part]
         if len(parts) < 3:
@@ -2965,6 +3869,26 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(parts) == 5 and parts[3] == "files":
             filename = parts[4]
             return self.serve_job_file(job, filename)
+
+        return self.send_error(HTTPStatus.NOT_FOUND)
+
+    def handle_translation_job_get(self, path: str):
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) < 3:
+            return self.send_error(HTTPStatus.NOT_FOUND)
+        job_id = parts[2]
+        with translation_jobs_lock:
+            job = translation_jobs.get(job_id)
+        if not job:
+            return self.send_json({"error": "Translation job not found."}, HTTPStatus.NOT_FOUND)
+
+        if len(parts) == 3:
+            with translation_jobs_lock:
+                payload = translation_job_to_dict(translation_jobs[job_id])
+            return self.send_json(payload)
+
+        if len(parts) == 4 and parts[3] == "download":
+            return self.serve_translation_zip(job)
 
         return self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -2998,6 +3922,26 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Disposition", attachment_content_disposition(zip_download_filename(job)))
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if not self.head_only:
+            self.wfile.write(data)
+
+    def serve_translation_zip(self, job: TranslationJob):
+        source_dir = translated_output_dir(job)
+        zip_path = job.output_dir / f"{job.id}_zh.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            if source_dir.exists():
+                for path in sorted(source_dir.glob("*")):
+                    if path.is_file():
+                        archive.write(path, arcname=f"{job.output_folder_name}/{path.name}")
+            summary_path = job.output_dir / "translation_summary.json"
+            if summary_path.exists():
+                archive.write(summary_path, arcname=f"{job.output_folder_name}/translation_summary.json")
+        data = zip_path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", attachment_content_disposition(translation_download_filename(job)))
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         if not self.head_only:
@@ -3039,6 +3983,7 @@ def main():
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     load_existing_jobs()
+    load_existing_translation_jobs()
     server = ThreadingHTTPServer((args.host, args.port), AppHandler)
     print(f"Subtitle Markdown Tool running at http://{args.host}:{args.port}", flush=True)
     server.serve_forever()

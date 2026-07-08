@@ -54,19 +54,40 @@ const settingsProviderState = document.querySelector("#settingsProviderState");
 const discoveryProviderSetting = document.querySelector("#discoveryProviderSetting");
 const youtubeApiKeyInput = document.querySelector("#youtubeApiKeyInput");
 const youtubeApiKeyState = document.querySelector("#youtubeApiKeyState");
+const translationApiKeyInput = document.querySelector("#translationApiKeyInput");
+const translationApiKeyState = document.querySelector("#translationApiKeyState");
 const discoveryCheckLimitInput = document.querySelector("#discoveryCheckLimitInput");
 const youtubeApiTimeoutInput = document.querySelector("#youtubeApiTimeoutInput");
 const youtubeApiAttemptsInput = document.querySelector("#youtubeApiAttemptsInput");
 const apiFallbackInput = document.querySelector("#apiFallbackInput");
 const settingsMessage = document.querySelector("#settingsMessage");
+const translationZipInput = document.querySelector("#translationZipInput");
+const translationFileName = document.querySelector("#translationFileName");
+const translateButton = document.querySelector("#translateButton");
+const stopTranslationButton = document.querySelector("#stopTranslationButton");
+const translationQueueSummary = document.querySelector("#translationQueueSummary");
+const translationProgressLabel = document.querySelector("#translationProgressLabel");
+const translationProgressCount = document.querySelector("#translationProgressCount");
+const translationProgressBar = document.querySelector("#translationProgressBar");
+const translationSummaryGrid = document.querySelector("#translationSummaryGrid");
+const translationMessages = document.querySelector("#translationMessages");
+const translationHistoryList = document.querySelector("#translationHistoryList");
+const refreshTranslationHistoryButton = document.querySelector("#refreshTranslationHistoryButton");
+const translationJobLabel = document.querySelector("#translationJobLabel");
+const retryTranslationButton = document.querySelector("#retryTranslationButton");
+const translationDownloadAll = document.querySelector("#translationDownloadAll");
+const translationResultList = document.querySelector("#translationResultList");
 const pageTabs = Array.from(document.querySelectorAll(".tab-button"));
 const pages = {
   search: document.querySelector("#searchPage"),
   extract: document.querySelector("#extractPage"),
+  translate: document.querySelector("#translatePage"),
 };
 
 let activeJobId = null;
 let pollTimer = null;
+let activeTranslationJobId = null;
+let translationPollTimer = null;
 let discoveryTaskPollTimer = null;
 let selectedFileUrl = null;
 let activeDiscoveryRecord = null;
@@ -81,8 +102,10 @@ let discoveryBusy = false;
 let pendingArchiveTitle = "";
 let submittingJob = false;
 let activeJobStatus = "";
+let activeTranslationJobStatus = "";
 const ACTIVE_JOB_KEY = "subtitleMarkdownTool.activeJobId";
 const RECENT_JOBS_KEY = "subtitleMarkdownTool.recentJobIds";
+const ACTIVE_TRANSLATION_JOB_KEY = "subtitleMarkdownTool.activeTranslationJobId";
 const ACTIVE_DISCOVERY_KEY = "subtitleMarkdownTool.activeDiscoveryId";
 const DISCOVERY_SELECTION_PREFIX = "subtitleMarkdownTool.discoverySelection.";
 
@@ -158,6 +181,7 @@ function setSettingsOpen(isOpen) {
     settingsMessage.textContent = "";
     settingsMessage.className = "settings-message";
     youtubeApiKeyInput.value = "";
+    translationApiKeyInput.value = "";
     loadSettings();
   }
 }
@@ -173,9 +197,14 @@ function renderSettings(settings) {
   const keyText = settings.youtube_api_key_configured
     ? `已配置 ${settings.youtube_api_key_masked || ""}`.trim()
     : "未配置";
+  const translationKeyText = settings.translation_api_key_configured
+    ? `已配置 ${settings.translation_api_key_masked || ""}`.trim()
+    : "未配置";
   youtubeApiKeyState.textContent = keyText;
   youtubeApiKeyInput.placeholder = settings.youtube_api_key_configured ? "留空则保持当前 key" : "AIza...";
-  settingsProviderState.textContent = `${discoveryProviderLabel(settings.discovery_provider)} · ${keyText}`;
+  translationApiKeyState.textContent = `${translationKeyText} · ${settings.translation_model || "gpt-5.5"}`;
+  translationApiKeyInput.placeholder = settings.translation_api_key_configured ? "留空则保持当前 key" : "OneAPI key";
+  settingsProviderState.textContent = `发现 ${discoveryProviderLabel(settings.discovery_provider)} · 翻译 ${translationKeyText}`;
 }
 
 async function loadSettings() {
@@ -197,6 +226,7 @@ async function saveSettings() {
   settingsMessage.textContent = "正在保存";
   settingsMessage.className = "settings-message";
   const apiKey = youtubeApiKeyInput.value.trim();
+  const translationApiKey = translationApiKeyInput.value.trim();
   const payload = {
     discovery_provider: discoveryProviderSetting.value,
     api_fallback_to_ytdlp: apiFallbackInput.checked,
@@ -205,6 +235,7 @@ async function saveSettings() {
     youtube_api_max_attempts: Number(youtubeApiAttemptsInput.value || 3),
   };
   if (apiKey) payload.youtube_api_key = apiKey;
+  if (translationApiKey) payload.translation_api_key = translationApiKey;
 
   try {
     const response = await fetch("/api/settings", {
@@ -215,6 +246,7 @@ async function saveSettings() {
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
     youtubeApiKeyInput.value = "";
+    translationApiKeyInput.value = "";
     renderSettings(result);
     settingsMessage.textContent = "已保存";
     settingsMessage.className = "settings-message success";
@@ -280,6 +312,24 @@ function updateProgress(job) {
     <span>提取总耗时 ${formatSeconds(summary.total_item_elapsed_seconds)}</span>
     <span>平均重试 ${Number(summary.average_retry_count || 0).toFixed(2)}</span>
     <span>分批 ${summary.auto_batch_size || "关闭"}</span>
+  `;
+}
+
+function updateTranslationProgress(job) {
+  const total = job.total || 0;
+  const current = job.current || 0;
+  const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+  translationProgressLabel.textContent = job.cancel_requested && !isTerminalJobStatus(job.status)
+    ? "停止中"
+    : statusText[job.status] || "等待任务";
+  translationProgressCount.textContent = `${current} / ${total}`;
+  translationProgressBar.style.width = `${pct}%`;
+  const summary = job.summary || {};
+  translationSummaryGrid.innerHTML = `
+    <span>成功 ${summary.success_count || 0}</span>
+    <span>失败 ${summary.error_count || 0}</span>
+    <span>平均耗时 ${formatSeconds(summary.average_elapsed_seconds)}</span>
+    <span>总耗时 ${formatSeconds(summary.total_item_elapsed_seconds)}</span>
   `;
 }
 
@@ -1159,6 +1209,279 @@ async function loadDiscoveryHistory() {
   }
 }
 
+function setTranslationMessage(text, type = "info") {
+  translationMessages.innerHTML = "";
+  if (!text) return;
+  const item = document.createElement("div");
+  item.className = `message ${type}`;
+  item.textContent = text;
+  translationMessages.appendChild(item);
+}
+
+function rememberTranslationJob(jobId) {
+  if (!jobId) return;
+  localStorage.setItem(ACTIVE_TRANSLATION_JOB_KEY, jobId);
+}
+
+function selectedTranslationFiles() {
+  return Array.from(translationZipInput.files || []);
+}
+
+function updateTranslationFileLabel() {
+  const files = selectedTranslationFiles();
+  if (!files.length) {
+    translationFileName.textContent = "选择一个或多个英文字幕 ZIP";
+    translationQueueSummary.textContent = "等待上传 ZIP";
+    return;
+  }
+  if (files.length === 1) {
+    translationFileName.textContent = files[0].name;
+    translationQueueSummary.textContent = `${files[0].name} · ${formatSize(files[0].size)}`;
+    return;
+  }
+  const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+  translationFileName.textContent = `${files.length} 个 ZIP 已选择`;
+  translationQueueSummary.textContent = `${files.length} 个 ZIP · ${formatSize(totalBytes)}`;
+}
+
+function startTranslationPolling(jobId) {
+  if (translationPollTimer) clearInterval(translationPollTimer);
+  translationPollTimer = setInterval(() => pollTranslationJob(jobId), 1800);
+}
+
+function renderTranslationFiles(job) {
+  if (!job.files.length) {
+    translationResultList.innerHTML = '<div class="empty-state">翻译完成后显示中文文件</div>';
+    return;
+  }
+  translationResultList.innerHTML = "";
+  job.files.forEach((file) => {
+    const item = document.createElement("article");
+    item.className = "result-item";
+
+    const info = document.createElement("div");
+    const title = document.createElement("div");
+    title.className = "result-title";
+    title.textContent = file.title || file.filename;
+
+    const meta = document.createElement("div");
+    meta.className = "result-meta";
+    meta.innerHTML = `
+      <span class="pill">${file.filename}</span>
+      <span class="pill">${file.source_filename || "源文件"}</span>
+      <span class="pill">${file.chunk_count || 1} 段</span>
+      <span class="pill">${formatSize(file.size_bytes)}</span>
+      <span class="pill">耗时 ${formatSeconds(file.elapsed_seconds)}</span>
+    `;
+    info.append(title, meta);
+    item.append(info);
+    translationResultList.appendChild(item);
+  });
+}
+
+function renderTranslationJob(job) {
+  activeTranslationJobId = job.id;
+  activeTranslationJobStatus = job.status;
+  rememberTranslationJob(job.id);
+  translationJobLabel.textContent = job.output_folder_name
+    ? `${job.output_folder_name} · 任务 ${job.id}`
+    : `任务 ${job.id}`;
+  translationQueueSummary.textContent = `${job.original_filename || "字幕 ZIP"} · ${statusText[job.status] || job.status}`;
+  updateTranslationProgress(job);
+  renderTranslationFiles(job);
+
+  translationMessages.innerHTML = "";
+  if (job.queue_position) {
+    setTranslationMessage(`任务已排队，前面还有 ${job.queue_position - 1} 个任务。`);
+  } else if (job.message) {
+    setTranslationMessage(job.message, job.status === "failed" ? "error" : "info");
+  }
+  job.errors.forEach((error) => {
+    const item = document.createElement("div");
+    item.className = "message error";
+    item.textContent = `${error.source_filename || "文件"}：${error.message}`;
+    translationMessages.appendChild(item);
+  });
+
+  const hasDownload = job.files.length > 0 || job.status === "completed" || job.status === "completed_with_errors";
+  if (hasDownload) {
+    translationDownloadAll.href = `/api/translation-jobs/${encodeURIComponent(job.id)}/download`;
+    if (job.download_filename) translationDownloadAll.download = job.download_filename;
+    translationDownloadAll.classList.remove("disabled");
+    translationDownloadAll.setAttribute("aria-disabled", "false");
+  } else {
+    translationDownloadAll.classList.add("disabled");
+    translationDownloadAll.setAttribute("aria-disabled", "true");
+    translationDownloadAll.removeAttribute("download");
+  }
+
+  const done = isTerminalJobStatus(job.status);
+  stopTranslationButton.hidden = done;
+  stopTranslationButton.disabled = done || Boolean(job.cancel_requested);
+  stopTranslationButton.textContent = job.cancel_requested && !done ? "停止中" : "停止/取消";
+  const canRetry = done && (job.status === "failed" || job.status === "completed_with_errors" || (job.errors || []).length > 0);
+  retryTranslationButton.hidden = !canRetry;
+  retryTranslationButton.disabled = !canRetry;
+  retryTranslationButton.textContent = "重试失败";
+  if (!done) {
+    serverState.textContent = "翻译中";
+  }
+  if (done && translationPollTimer) {
+    clearInterval(translationPollTimer);
+    translationPollTimer = null;
+    setBusy(false);
+  }
+  loadTranslationHistory();
+}
+
+async function pollTranslationJob(jobId) {
+  try {
+    const response = await fetch(`/api/translation-jobs/${encodeURIComponent(jobId)}`);
+    const job = await response.json();
+    if (!response.ok) throw new Error(job.error || `HTTP ${response.status}`);
+    renderTranslationJob(job);
+    return job;
+  } catch (error) {
+    setTranslationMessage(`翻译状态读取失败：${error.message}`, "error");
+    if (translationPollTimer) {
+      clearInterval(translationPollTimer);
+      translationPollTimer = null;
+    }
+  }
+}
+
+async function createTranslationJob() {
+  const files = selectedTranslationFiles();
+  if (!files.length) {
+    setTranslationMessage("请先选择 ZIP 文件", "error");
+    return;
+  }
+
+  const formData = new FormData();
+  files.forEach((file) => formData.append("files", file, file.name));
+  translateButton.disabled = true;
+  setBusy(true);
+  setTranslationMessage("翻译任务已提交");
+  translationResultList.innerHTML = '<div class="empty-state">正在翻译</div>';
+  translationDownloadAll.classList.add("disabled");
+  translationDownloadAll.setAttribute("aria-disabled", "true");
+  translationProgressBar.style.width = "0%";
+  translationProgressCount.textContent = "0 / 0";
+  translationProgressLabel.textContent = "排队中";
+
+  try {
+    const response = await fetch("/api/translation-jobs", {
+      method: "POST",
+      body: formData,
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    const jobs = payload.jobs || (payload.id ? [payload] : []);
+    if (!jobs.length) throw new Error("没有创建翻译任务。");
+    const firstJob = jobs[0];
+    renderTranslationJob(firstJob);
+    startTranslationPolling(firstJob.id);
+    pollTranslationJob(firstJob.id);
+    if (jobs.length > 1) {
+      setTranslationMessage(`已创建 ${jobs.length} 个翻译任务，可在左侧历史中分别查看。`);
+    }
+    if (payload.upload_errors && payload.upload_errors.length) {
+      payload.upload_errors.forEach((item) => {
+        const message = document.createElement("div");
+        message.className = "message error";
+        message.textContent = `${item.filename || "ZIP"}：${item.message}`;
+        translationMessages.appendChild(message);
+      });
+    }
+    loadTranslationHistory();
+  } catch (error) {
+    setTranslationMessage(error.message, "error");
+    setBusy(false);
+  } finally {
+    translateButton.disabled = false;
+  }
+}
+
+async function stopActiveTranslationJob() {
+  if (!activeTranslationJobId) return;
+  stopTranslationButton.disabled = true;
+  stopTranslationButton.textContent = "停止中";
+  try {
+    const response = await fetch(`/api/translation-jobs/${encodeURIComponent(activeTranslationJobId)}/stop`, {
+      method: "POST",
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    renderTranslationJob(payload);
+    if (!isTerminalJobStatus(payload.status)) startTranslationPolling(payload.id);
+  } catch (error) {
+    setTranslationMessage(`停止失败：${error.message}`, "error");
+    stopTranslationButton.disabled = false;
+    stopTranslationButton.textContent = "停止/取消";
+  }
+}
+
+async function retryActiveTranslationJob() {
+  if (!activeTranslationJobId) return;
+  retryTranslationButton.disabled = true;
+  retryTranslationButton.textContent = "重试中";
+  try {
+    const response = await fetch(`/api/translation-jobs/${encodeURIComponent(activeTranslationJobId)}/retry`, {
+      method: "POST",
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    renderTranslationJob(payload);
+    startTranslationPolling(payload.id);
+    pollTranslationJob(payload.id);
+  } catch (error) {
+    setTranslationMessage(`重试失败：${error.message}`, "error");
+    retryTranslationButton.disabled = false;
+    retryTranslationButton.textContent = "重试失败";
+  }
+}
+
+async function restoreTranslationJob(jobId) {
+  switchPage("translate");
+  const job = await pollTranslationJob(jobId);
+  const done = job && isTerminalJobStatus(job.status);
+  if (job && !done) startTranslationPolling(jobId);
+}
+
+function renderTranslationHistory(jobs) {
+  if (!jobs.length) {
+    translationHistoryList.innerHTML = '<div class="history-empty">暂无翻译任务</div>';
+    return;
+  }
+  translationHistoryList.innerHTML = "";
+  jobs.forEach((job) => {
+    const item = document.createElement("button");
+    item.className = "history-item";
+    item.type = "button";
+    const summary = job.summary || {};
+    const title = job.output_folder_name || job.id;
+    const statusLabel = job.cancel_requested && !isTerminalJobStatus(job.status) ? "停止中" : statusText[job.status] || job.status;
+    const queueText = job.queue_position ? ` · 排队第 ${job.queue_position}` : "";
+    item.innerHTML = `
+      <span class="history-title">${title} · ${statusLabel}${queueText}</span>
+      <span class="history-meta">${job.current || 0}/${job.total || 0} · 成功 ${summary.success_count || 0} · 失败 ${summary.error_count || 0} · ${formatDateTime(job.updated_at)}</span>
+    `;
+    item.addEventListener("click", () => restoreTranslationJob(job.id));
+    translationHistoryList.appendChild(item);
+  });
+}
+
+async function loadTranslationHistory() {
+  try {
+    const response = await fetch("/api/translation-jobs");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    renderTranslationHistory(payload.jobs || []);
+  } catch (error) {
+    translationHistoryList.innerHTML = `<div class="history-empty">${error.message}</div>`;
+  }
+}
+
 function fileUrl(jobId, filename) {
   return `/api/jobs/${encodeURIComponent(jobId)}/files/${encodeURIComponent(filename)}`;
 }
@@ -1433,6 +1756,11 @@ async function init() {
   cancelSettingsButton.addEventListener("click", () => setSettingsOpen(false));
   settingsBackdrop.addEventListener("click", () => setSettingsOpen(false));
   saveSettingsButton.addEventListener("click", saveSettings);
+  translationZipInput.addEventListener("change", updateTranslationFileLabel);
+  translateButton.addEventListener("click", createTranslationJob);
+  stopTranslationButton.addEventListener("click", stopActiveTranslationJob);
+  retryTranslationButton.addEventListener("click", retryActiveTranslationJob);
+  refreshTranslationHistoryButton.addEventListener("click", loadTranslationHistory);
   selectAllDiscovery.addEventListener("click", () => selectDiscoveryVideos(true));
   clearDiscoverySelection.addEventListener("click", () => selectDiscoveryVideos(false));
   importDiscovery.addEventListener("click", importSelectedDiscoveryUrls);
@@ -1450,7 +1778,7 @@ async function init() {
 
   updateImportQueueSummary();
   updateRunButtonState();
-  await Promise.all([loadHistory(), loadDiscoveryHistory(), loadChannels(), loadSettings()]);
+  await Promise.all([loadHistory(), loadTranslationHistory(), loadDiscoveryHistory(), loadChannels(), loadSettings()]);
 
   const activeDiscoveryId = localStorage.getItem(ACTIVE_DISCOVERY_KEY);
   if (activeDiscoveryId) {
@@ -1460,6 +1788,11 @@ async function init() {
   const active = localStorage.getItem(ACTIVE_JOB_KEY);
   if (active) {
     restoreJob(active);
+  }
+
+  const activeTranslation = localStorage.getItem(ACTIVE_TRANSLATION_JOB_KEY);
+  if (activeTranslation) {
+    restoreTranslationJob(activeTranslation);
   }
 }
 

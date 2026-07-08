@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>视频字幕转 Markdown</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260707-job-queue" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260708-translate-zip" />
   </head>
   <body>
     <header class="topbar">
@@ -15,6 +15,7 @@
       <nav class="page-tabs" aria-label="主页面">
         <button class="tab-button active" id="searchTab" type="button" data-page="search">查找</button>
         <button class="tab-button" id="extractTab" type="button" data-page="extract">导入下载</button>
+        <button class="tab-button" id="translateTab" type="button" data-page="translate">字幕翻译</button>
       </nav>
       <div class="topbar-actions">
         <div class="server-state" id="serverState">
@@ -32,7 +33,7 @@
     <aside class="settings-panel" id="settingsPanel" aria-label="设置面板" hidden>
       <div class="settings-panel-head">
         <div>
-          <h2>发现设置</h2>
+          <h2>设置</h2>
           <p id="settingsProviderState">读取配置中</p>
         </div>
         <button class="secondary small icon-only" id="settingsCloseButton" type="button" aria-label="关闭设置">×</button>
@@ -51,6 +52,12 @@
         <input id="youtubeApiKeyInput" type="password" autocomplete="off" placeholder="AIza..." />
       </label>
       <div class="settings-key-state" id="youtubeApiKeyState">未配置</div>
+
+      <label class="settings-field">
+        <span>翻译 API Key</span>
+        <input id="translationApiKeyInput" type="password" autocomplete="off" placeholder="OneAPI key" />
+      </label>
+      <div class="settings-key-state" id="translationApiKeyState">未配置</div>
 
       <div class="settings-grid">
         <label class="settings-field">
@@ -274,8 +281,82 @@ https://www.youtube.com/watch?v=f6SIJDGGjuY</textarea>
           </section>
         </div>
       </section>
+
+      <section class="page" id="translatePage" aria-labelledby="translateTitle">
+        <div class="workspace">
+          <section class="input-pane" aria-labelledby="translateTitle">
+            <div class="section-head">
+              <div>
+                <h2 id="translateTitle">字幕翻译</h2>
+                <p id="translationQueueSummary">等待上传 ZIP</p>
+              </div>
+              <span class="limit">批量 ZIP</span>
+            </div>
+
+            <label class="upload-drop" for="translationZipInput">
+              <input id="translationZipInput" type="file" accept=".zip,application/zip" multiple hidden />
+              <span class="upload-icon">↑</span>
+              <span class="upload-title" id="translationFileName">选择一个或多个英文字幕 ZIP</span>
+              <span class="upload-meta">每个 ZIP 会生成一个独立任务，输出文件夹会使用原文件夹名加 _zh</span>
+            </label>
+
+            <div class="actions">
+              <button class="primary" id="translateButton" type="button">
+                <span class="button-icon">▶</span>
+                <span>开始翻译</span>
+              </button>
+              <button class="secondary danger" id="stopTranslationButton" type="button" hidden>停止/取消</button>
+            </div>
+
+            <div class="progress-block">
+              <div class="progress-copy">
+                <span id="translationProgressLabel">等待任务</span>
+                <span id="translationProgressCount">0 / 0</span>
+              </div>
+              <div class="progress-track" aria-hidden="true">
+                <div id="translationProgressBar"></div>
+              </div>
+              <div class="summary-grid" id="translationSummaryGrid">
+                <span>成功 0</span>
+                <span>失败 0</span>
+                <span>平均耗时 0s</span>
+                <span>总耗时 0s</span>
+              </div>
+            </div>
+
+            <div class="messages" id="translationMessages"></div>
+
+            <div class="history-block">
+              <div class="history-head">
+                <h2>翻译任务</h2>
+                <button class="secondary small" id="refreshTranslationHistoryButton" type="button">刷新</button>
+              </div>
+              <div class="history-list" id="translationHistoryList">
+                <div class="history-empty">暂无翻译任务</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="results-pane" aria-labelledby="translationResultsTitle">
+            <div class="section-head">
+              <div>
+                <h2 id="translationResultsTitle">翻译结果</h2>
+                <p id="translationJobLabel">尚未创建任务</p>
+              </div>
+              <div class="section-actions">
+                <button class="secondary small" id="retryTranslationButton" type="button" hidden>重试失败</button>
+                <a class="download-all disabled" id="translationDownloadAll" href="#" aria-disabled="true">下载 ZIP</a>
+              </div>
+            </div>
+
+            <div class="result-list" id="translationResultList">
+              <div class="empty-state">翻译完成后显示中文文件</div>
+            </div>
+          </section>
+        </div>
+      </section>
     </main>
 
-    <script src="/static/app.js?v=20260707-job-queue"></script>
+    <script src="/static/app.js?v=20260708-translate-zip"></script>
   </body>
 </html>
